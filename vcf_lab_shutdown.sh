@@ -165,6 +165,7 @@ die() {
 
 cleanup() {
   local -r exit_code="${?}"
+  trap - EXIT
   rm -rf "${TMP_DIR}" 2> /dev/null || true
   if [[ "${exit_code}" -ne 0 ]]; then
     log_error "Script interrompu (code ${exit_code})."
@@ -172,7 +173,9 @@ cleanup() {
   fi
   exit "${exit_code}"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # run <cmd...> — exécute une action destructive (ou la journalise en dry-run)
 run() {
@@ -187,7 +190,7 @@ run() {
 in_list() {
   local needle="${1}" item
   shift
-  for item in "${@}"; do
+  for item in ${@+"${@}"}; do
     [[ "${item}" == "${needle}" ]] && return 0
   done
   return 1
@@ -365,7 +368,7 @@ wait_vm_off() {
 # resolve_vms <ids...> → chemins (un par ligne) ; VMs introuvables ignorées
 resolve_vms() {
   local id path rc
-  for id in "${@}"; do
+  for id in ${@+"${@}"}; do
     rc=0
     path=$(resolve_vm "${id}") || rc=$?
     case "${rc}" in
@@ -808,6 +811,12 @@ preflight() {
     state=$(vcfops_online_state)
     case "${state}" in
       UNREACHABLE) die "API CaSA de VCF Operations injoignable (FQDN/mot de passe admin ?). Sinon VCFOPS_OFFLINE_MODE=ui." ;;
+      UNKNOWN)
+        local raw
+        raw=$(vcfops_curl "https://${VCFOPS_PRIMARY_FQDN}/casa/sysadmin/cluster/online_state" 2> /dev/null || true)
+        log_warn "VCF Operations — état du cluster illisible. Réponse : ${raw:0:400}"
+        log_warn "  Le passage offline sera demandé, puis confirmé à la main si l'état reste illisible."
+        ;;
       *) log "VCF Operations — état du cluster : ${state}" ;;
     esac
   fi
@@ -871,11 +880,11 @@ step_ui_or_vm() {
       ;;
     ui)
       manual_checkpoint "${howto}"
-      verify_vms_off "${label}" "${@}"
+      verify_vms_off "${label}" ${@+"${@}"}
       ;;
     vm)
       log_warn "Mode 'vm' : arrêt Guest OS direct, hors procédure officielle (raccourci de lab)."
-      shutdown_vms "${label}" sequential "${@}"
+      shutdown_vms "${label}" sequential ${@+"${@}"}
       ;;
   esac
 }
@@ -1210,7 +1219,7 @@ step_11_vsan_esx() {
 # Main
 # ---------------------------------------------------------------------------
 main() {
-  parse_args "${@}"
+  parse_args ${@+"${@}"}
   load_config
   setup_logging
 
@@ -1243,4 +1252,4 @@ main() {
   log "Étapes ${FROM_STEP} à ${TO_STEP} terminées."
 }
 
-main "${@}"
+main ${@+"${@}"}
