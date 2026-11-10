@@ -1,0 +1,8 @@
+# Journaux d'exécution
+logs/
+
+# Script officiel Broadcom (Broadcom Confidential, KB 440874) : ne pas versionner
+vcf_services_runtime_shutdown.sh
+
+# Copies de configuration locales
+*.local.conf
