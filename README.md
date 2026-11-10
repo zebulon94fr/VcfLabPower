@@ -54,7 +54,7 @@ Le fichier `vcf_lab_shutdown.conf` est commenté. On y renseigne :
 - le vCenter de gestion (`GOVC_URL`, `GOVC_USERNAME`), le cluster (`MGMT_CLUSTER`) et la VM vCenter (`VCENTER_VM`) ;
 - les hôtes ESX (`ESX_HOSTS`) : le premier exécute `reboot_helper.py` et s'éteint en dernier ;
 - les noms de VMs de chaque étape (nom d'inventaire vCenter ou MoRef `VirtualMachine:vm-123`) ;
-- l'IP d'un nœud control plane du VCF services runtime (`VCFMS_NODE_IP`). Les VMs des nœuds sont découvertes via l'API ;
+- l'IP d'un nœud control plane du VCF services runtime (`VCFMS_NODE_IP`). Les VMs des nœuds sont découvertes via l'API. Sur certains builds 9.1.1, l'endpoint d'inventaire renvoie HTTP 404 : il faut alors renseigner `VCFMS_VMS` (noms exacts) ou `VCFMS_VM_PATTERN` (motif glob recherché dans vCenter) ;
 - les modes :
   - `VCFA_MODE` / `VCFNET_MODE` : `ui` (pause manuelle, méthode de la doc), `vm` (arrêt Guest OS direct, raccourci de lab) ou `none` ;
   - `VCFOPS_OFFLINE_MODE` : `api` ou `ui` ;

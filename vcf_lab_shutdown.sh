@@ -118,6 +118,7 @@ set_defaults() {
   VMSP_PASSWORD="${VMSP_PASSWORD:-}"
   VCFMS_SHUTDOWN_SCRIPT="${SCRIPT_DIR}/vcf_services_runtime_shutdown.sh"
   VCFMS_VMS=()
+  VCFMS_VM_PATTERN=""
 
   VCFOPS_OFFLINE_MODE="api"   # api | ui
   VCFOPS_PRIMARY_FQDN=""
@@ -285,12 +286,16 @@ setup_logging() {
 # Helpers vCenter (govc) — utilisables tant que le vCenter est en ligne
 # ---------------------------------------------------------------------------
 
-# resolve_vm <nom | VirtualMachine:vm-xx> → chemin d'inventaire sur stdout
+# resolve_vm <nom | /chemin/inventaire | VirtualMachine:vm-xx> → chemin d'inventaire sur stdout
 #   rc 1 = introuvable, rc 2 = nom ambigu
 resolve_vm() {
   local id="${1}" out count
   if [[ "${id}" == VirtualMachine:* ]]; then
     out=$(govc ls -L "${id}" 2> /dev/null) || return 1
+  elif [[ "${id}" == /* ]]; then
+    # Chemin d'inventaire complet : on vérifie seulement qu'il existe
+    govc object.collect -s "${id}" name > /dev/null 2>&1 || return 1
+    out="${id}"
   else
     out=$(govc find / -type m -name "${id}" 2> /dev/null) || return 1
   fi
@@ -680,6 +685,7 @@ discover_vcfms_vms() {
     code=$(vcfms_http_code)
     if [[ "${code}" != 2* ]]; then
       log_warn "  GET /api/v1/system/inventory/nodes : HTTP ${code} — ${body:0:300}"
+      [[ "${code}" == "404" ]] && log_warn "  Endpoint absent sur ce build du VCF services runtime."
     else
       parsed=$(printf '%s' "${body}" | parse_vcfms_nodes || true)
       [[ -n "${parsed}" ]] ||
@@ -700,14 +706,27 @@ discover_vcfms_vms() {
     VCFMS_VM_IDS+=("${moref}")
   done <<< "${parsed}"
 
-  if [[ "${#VCFMS_VM_IDS[@]}" -eq 0 ]]; then
-    if [[ "${#VCFMS_VMS[@]}" -gt 0 ]]; then
-      log_warn "  Liste API indisponible — utilisation de VCFMS_VMS de la configuration."
-      VCFMS_VM_IDS=("${VCFMS_VMS[@]}")
-    else
-      die "VMs du VCF services runtime introuvables via l'API. Renseigne VCFMS_VMS dans la conf (noms visibles dans VCF Operations > Build > Lifecycle > VCF Management Components > VCF services runtime > Nodes)."
-    fi
+  [[ "${#VCFMS_VM_IDS[@]}" -gt 0 ]] && return 0
+
+  if [[ "${#VCFMS_VMS[@]}" -gt 0 ]]; then
+    log_warn "  Liste API indisponible — utilisation de VCFMS_VMS de la configuration."
+    VCFMS_VM_IDS=("${VCFMS_VMS[@]}")
+    return 0
   fi
+
+  if [[ -n "${VCFMS_VM_PATTERN}" ]]; then
+    log_warn "  Liste API indisponible — recherche dans vCenter des VMs '${VCFMS_VM_PATTERN}'."
+    local path
+    while IFS= read -r path; do
+      [[ -z "${path}" ]] && continue
+      log "  VM trouvée : ${path}"
+      VCFMS_VM_IDS+=("${path}")
+    done <<< "$(govc find / -type m -name "${VCFMS_VM_PATTERN}" 2> /dev/null || true)"
+    [[ "${#VCFMS_VM_IDS[@]}" -gt 0 ]] && return 0
+    log_warn "  Aucune VM ne correspond à '${VCFMS_VM_PATTERN}'."
+  fi
+
+  die "VMs du VCF services runtime introuvables. Renseigne VCFMS_VMS ou VCFMS_VM_PATTERN dans la conf (noms visibles dans VCF Operations > Build > Lifecycle > VCF Management Components > VCF services runtime > Nodes)."
 }
 
 write_vcfops_curl_cfg() {
