@@ -698,6 +698,13 @@ discover_vcfms_vms() {
     log_warn "  Login API VCFMS : HTTP ${code} — ${body:0:300}"
   else
     log "  Login API VCFMS OK."
+    vcfms_http "${base}/api/v1/components" -H "Authorization: Bearer ${token}" \
+      -H "Accept: application/json" > /dev/null
+    code=$(vcfms_http_code)
+    if [[ "${code}" == "404" ]]; then
+      die "${VCFMS_NODE_IP} accepte le login mais ne sert pas l'API de gestion (GET /api/v1/components → 404). Utilise le FQDN ou la VIP du VCF services runtime dans VCFMS_NODE_IP, pas l'IP d'un nœud."
+    fi
+    log "  API de gestion joignable (GET /api/v1/components → HTTP ${code})."
     body=$(vcfms_http "${base}/api/v1/system/inventory/nodes" \
       -H "Authorization: Bearer ${token}" -H "Accept: application/json")
     code=$(vcfms_http_code)
