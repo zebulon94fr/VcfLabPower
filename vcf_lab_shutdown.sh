@@ -274,8 +274,11 @@ parse_args() {
 load_config() {
   set_defaults
   [[ -f "${CONFIG_FILE}" ]] || die "Fichier de configuration introuvable : ${CONFIG_FILE}"
+  bash -n "${CONFIG_FILE}" || die "Erreur de syntaxe dans ${CONFIG_FILE} (voir ci-dessus)."
   # shellcheck source=/dev/null
-  source "${CONFIG_FILE}"
+  if ! source "${CONFIG_FILE}"; then
+    die "Le chargement de ${CONFIG_FILE} a échoué (commande en erreur dans le fichier ?)."
+  fi
 
   case "${VCFA_MODE}" in ui | vm | none) ;; *) die "VCFA_MODE invalide : ${VCFA_MODE}" ;; esac
   case "${VCFNET_MODE}" in ui | vm | none) ;; *) die "VCFNET_MODE invalide : ${VCFNET_MODE}" ;; esac
@@ -759,7 +762,8 @@ vcfops_curl() {
 
 vcfops_online_state() {
   vcfops_curl "https://${VCFOPS_PRIMARY_FQDN}/casa/sysadmin/cluster/online_state" 2> /dev/null |
-    jq -r '.online_state // .onlineState // "UNKNOWN"' 2> /dev/null || echo "UNREACHABLE"
+    jq -r '.cluster_online_state_snapshot // .online_state // .onlineState // "UNKNOWN"' 2> /dev/null ||
+    echo "UNREACHABLE"
 }
 
 check_esx_hosts() {
