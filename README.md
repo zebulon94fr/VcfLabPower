@@ -203,4 +203,4 @@ Pour démarrer ensuite les workload domains, voir [Start the Virtual Infrastruct
 - [KB 322144 – reboot_helper.py](https://knowledge.broadcom.com/external/article/322144)
 - [KB 390160](https://knowledge.broadcom.com/external/article/390160), [KB 455801](https://knowledge.broadcom.com/external/article/455801), [KB 410326](https://knowledge.broadcom.com/external/article/410326/vsan-cluster-shutdown-preparation-fails.html)
 
-Ce projet n'est pas affilié à Broadcom ni à VMware. Utilisation à tes risques.
+Ce projet n'est pas affilié à Broadcom ni à VMware. 
