@@ -46,13 +46,13 @@ Si une liste de VMs est vide dans la configuration, l'étape correspondante est 
 git clone https://github.com/zebulon94fr/VcfLabPower.git
 cd VcfLabPower
 # copier ici vcf_services_runtime_shutdown.sh (KB 440874)
-cp vcf_lab_shutdown.conf mon-lab.local.conf   # ignoré par git
-vi mon-lab.local.conf
+cp vcf_lab_shutdown.conf vcf_lab_shutdown.local.conf   # ignoré par git, chargé automatiquement
+vi vcf_lab_shutdown.local.conf
 ```
 
 ## Configuration
 
-Le fichier `vcf_lab_shutdown.conf` est commenté. On y renseigne :
+Le fichier `vcf_lab_shutdown.conf` est un **exemple versionné** : ne le modifie pas, sinon `git pull` sera bloqué. Copie-le en `vcf_lab_shutdown.local.conf`, que le script charge automatiquement et que git ignore. `--config` permet d'en choisir un autre. On y renseigne :
 
 - le vCenter de gestion (`GOVC_URL`, `GOVC_USERNAME`), le cluster (`MGMT_CLUSTER`) et la VM vCenter (`VCENTER_VM`) ;
 - les hôtes ESX (`ESX_HOSTS`) : le premier exécute `reboot_helper.py` et s'éteint en dernier ;
@@ -77,9 +77,9 @@ Les secrets se passent par variables d'environnement. S'ils sont absents, le scr
 ## Utilisation
 
 ```bash
-./vcf_lab_shutdown.sh --config mon-lab.local.conf --dry-run   # simulation
-./vcf_lab_shutdown.sh --config mon-lab.local.conf             # arrêt réel (confirmation « SHUTDOWN »)
-./vcf_lab_shutdown.sh --config mon-lab.local.conf --from-step 6   # reprise après échec
+./vcf_lab_shutdown.sh --dry-run   # simulation (charge vcf_lab_shutdown.local.conf)
+./vcf_lab_shutdown.sh             # arrêt réel (confirmation « SHUTDOWN »)
+./vcf_lab_shutdown.sh --from-step 6   # reprise après échec
 ```
 
 | Option | Effet |

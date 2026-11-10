@@ -35,8 +35,9 @@
 #   vcf_lab_shutdown.sh [OPTIONS]
 #
 # Options :
-#   --config FICHIER        Fichier de configuration
-#                           (défaut : vcf_lab_shutdown.conf à côté du script).
+#   --config FICHIER        Fichier de configuration (défaut, à côté du script :
+#                           vcf_lab_shutdown.local.conf s'il existe, sinon
+#                           vcf_lab_shutdown.conf).
 #   --dry-run               Affiche les actions prévues sans rien arrêter.
 #   --from-step N           Reprend à l'étape N (0-11).
 #   --to-step N             S'arrête après l'étape N (0-11).
@@ -81,7 +82,12 @@ FORCE_POWEROFF="false"
 SKIP_SNAPSHOT_CHECK="false"
 FROM_STEP=0
 TO_STEP="${LAST_STEP}"
-CONFIG_FILE="${SCRIPT_DIR}/vcf_lab_shutdown.conf"
+# Conf locale (ignorée par git) prioritaire sur la conf d'exemple versionnée
+if [[ -f "${SCRIPT_DIR}/vcf_lab_shutdown.local.conf" ]]; then
+  CONFIG_FILE="${SCRIPT_DIR}/vcf_lab_shutdown.local.conf"
+else
+  CONFIG_FILE="${SCRIPT_DIR}/vcf_lab_shutdown.conf"
+fi
 
 TMP_DIR="$(mktemp -d)"
 VCFOPS_CURL_CFG="${TMP_DIR}/vcfops.curlrc"
