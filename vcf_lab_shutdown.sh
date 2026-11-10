@@ -636,44 +636,76 @@ check_inventory_and_snapshots() {
   fi
 }
 
+# vcfms_http <args curl...> → corps de réponse sur stdout, code HTTP dans VCFMS_HTTP_CODE
+# (fichier temporaire : la valeur est perdue si on l'appelle dans $(...))
+vcfms_http() {
+  local code_file="${TMP_DIR}/vcfms_http_code"
+  curl -sk --max-time 30 -o "${TMP_DIR}/vcfms_http_body" -w '%{http_code}' "${@}" > "${code_file}" 2> /dev/null ||
+    echo "000" > "${code_file}"
+  cat "${TMP_DIR}/vcfms_http_body" 2> /dev/null || true
+}
+
+vcfms_http_code() { cat "${TMP_DIR}/vcfms_http_code" 2> /dev/null || echo "000"; }
+
+# Extrait « nom|moRef » d'une réponse d'inventaire, en acceptant plusieurs formes
+# (tableau racine, .nodes, .items, .data ; moRef sous .vm ou à plat).
+parse_vcfms_nodes() {
+  jq -r '
+    (if type == "array" then . else (.nodes // .items // .data // .results // []) end)
+    | .[]?
+    | "\(.name // .hostname // .nodeName // .id // "?")|\(
+        .vm.moRef // .vm.moref // .vm.moid // .vm.id // .vmMoRef // .vmMoref
+        // .vm_moref // .moRef // .moref // "")"' 2> /dev/null
+}
+
 discover_vcfms_vms() {
   VCFMS_VM_IDS=()
   [[ -z "${VCFMS_NODE_IP}" ]] && return 0
 
   log "Découverte des nœuds VCF services runtime via l'API (${VCFMS_NODE_IP}:${VCFMS_NODE_PORT})..."
-  local base="https://${VCFMS_NODE_IP}:${VCFMS_NODE_PORT}" token="" nodes="" entry name moref
-  token=$(jq -n --arg u "${VMSP_API_USER}" --arg p "${VMSP_PASSWORD}" '{username: $u, password: $p}' |
-    curl -sk --fail --max-time 30 -X POST "${base}/api/v1/auth/login" \
-      -H "Content-Type: application/json" --data-binary @- 2> /dev/null |
-    jq -r '.token // empty' 2> /dev/null) || token=""
+  local base="https://${VCFMS_NODE_IP}:${VCFMS_NODE_PORT}" body code token="" entry name moref parsed=""
 
-  if [[ -n "${token}" ]]; then
-    nodes=$(curl -sk --fail --max-time 30 "${base}/api/v1/system/inventory/nodes" \
-      -H "Authorization: Bearer ${token}" -H "Accept: application/json" 2> /dev/null) || nodes=""
+  body=$(jq -n --arg u "${VMSP_API_USER}" --arg p "${VMSP_PASSWORD}" '{username: $u, password: $p}' |
+    vcfms_http -X POST "${base}/api/v1/auth/login" -H "Content-Type: application/json" --data-binary @-)
+  code=$(vcfms_http_code)
+  if [[ "${code}" == "200" ]]; then
+    token=$(printf '%s' "${body}" | jq -r '.token // empty' 2> /dev/null || true)
+  fi
+  if [[ -z "${token}" ]]; then
+    log_warn "  Login API VCFMS : HTTP ${code} — ${body:0:300}"
   else
-    log_warn "  Authentification à l'API VCFMS impossible."
+    log "  Login API VCFMS OK."
+    body=$(vcfms_http "${base}/api/v1/system/inventory/nodes" \
+      -H "Authorization: Bearer ${token}" -H "Accept: application/json")
+    code=$(vcfms_http_code)
+    if [[ "${code}" != 2* ]]; then
+      log_warn "  GET /api/v1/system/inventory/nodes : HTTP ${code} — ${body:0:300}"
+    else
+      parsed=$(printf '%s' "${body}" | parse_vcfms_nodes || true)
+      [[ -n "${parsed}" ]] ||
+        log_warn "  Réponse d'inventaire non reconnue (HTTP ${code}) : ${body:0:500}"
+    fi
   fi
 
-  if [[ -n "${nodes}" ]]; then
-    while IFS= read -r entry; do
-      [[ -z "${entry}" ]] && continue
-      name="${entry%%|*}"
-      moref="${entry#*|}"
-      if [[ -z "${moref}" ]]; then
-        log_warn "  Nœud '${name}' sans MoRef VM — ignoré."
-        continue
-      fi
-      log "  Nœud '${name}' → VirtualMachine:${moref}"
-      VCFMS_VM_IDS+=("VirtualMachine:${moref}")
-    done <<< "$(printf '%s' "${nodes}" | jq -r '.nodes // [] | .[] | "\(.name // "")|\(.vm.moRef // "")"')"
-  fi
+  while IFS= read -r entry; do
+    [[ -z "${entry}" ]] && continue
+    name="${entry%%|*}"
+    moref="${entry#*|}"
+    if [[ -z "${moref}" ]]; then
+      log_warn "  Nœud '${name}' sans MoRef VM dans la réponse — ignoré."
+      continue
+    fi
+    [[ "${moref}" == VirtualMachine:* ]] || moref="VirtualMachine:${moref}"
+    log "  Nœud '${name}' → ${moref}"
+    VCFMS_VM_IDS+=("${moref}")
+  done <<< "${parsed}"
 
   if [[ "${#VCFMS_VM_IDS[@]}" -eq 0 ]]; then
     if [[ "${#VCFMS_VMS[@]}" -gt 0 ]]; then
       log_warn "  Liste API indisponible — utilisation de VCFMS_VMS de la configuration."
       VCFMS_VM_IDS=("${VCFMS_VMS[@]}")
     else
-      die "Impossible de déterminer les VMs du VCF services runtime (API KO et VCFMS_VMS vide)."
+      die "VMs du VCF services runtime introuvables via l'API. Renseigne VCFMS_VMS dans la conf (noms visibles dans VCF Operations > Build > Lifecycle > VCF Management Components > VCF services runtime > Nodes)."
     fi
   fi
 }
