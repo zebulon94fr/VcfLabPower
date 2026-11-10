@@ -34,6 +34,9 @@ Si une liste de VMs est vide dans la configuration, l'étape correspondante est 
 - vSAN uniquement : `ssh` vers les ESX, et `sshpass` si l'accès se fait par mot de passe plutôt que par clé. En NFS/FC, SSH n'est pas nécessaire.
 - Le script officiel **`vcf_services_runtime_shutdown.sh`**, à télécharger depuis la [KB 440874](https://knowledge.broadcom.com/external/article/440874) et à placer à côté de `vcf_lab_shutdown.sh`.
   Il n'est pas versionné ici (Broadcom Confidential).
+  - Prends **la pièce jointe actuelle** de la KB. Une ancienne copie peut appeler des endpoints absents de ton build (HTTP 404 sur `/api/v1/system?action=shutdown` constaté en 9.1.1.0100).
+  - `vcf_lab_shutdown.sh` détecte les options de la version présente (`--skip-poweroff` ou `--poweroff-vms`, `--kubeconfig`) et n'envoie que celles qu'elle accepte.
+  - Si la version demande `--kubeconfig`, renseigne `VCFMS_KUBECONFIG`.
 - Pas de snapshot sur les VMs : le précheck du VCF services runtime échoue s'il en trouve.
 - Les workload domains déjà arrêtés.
 

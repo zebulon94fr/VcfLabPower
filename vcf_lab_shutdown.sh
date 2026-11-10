@@ -122,6 +122,7 @@ set_defaults() {
   VCFMS_SHUTDOWN_SCRIPT="${SCRIPT_DIR}/vcf_services_runtime_shutdown.sh"
   VCFMS_VMS=()
   VCFMS_VM_PATTERN=""
+  VCFMS_KUBECONFIG=""   # requis par les versions récentes du script officiel (--kubeconfig)
 
   VCFOPS_OFFLINE_MODE="api"   # api | ui
   VCFOPS_PRIMARY_FQDN=""
@@ -812,6 +813,10 @@ preflight() {
 
   if step_in_range 5 && [[ -n "${VCFMS_NODE_IP}" ]]; then
     [[ -f "${VCFMS_SHUTDOWN_SCRIPT}" ]] || die "Script officiel introuvable : ${VCFMS_SHUTDOWN_SCRIPT} (KB 440874)."
+    official_script_info
+    if official_supports --kubeconfig && [[ -z "${VCFMS_KUBECONFIG}" ]]; then
+      die "Ce script officiel attend --kubeconfig : renseigne VCFMS_KUBECONFIG (cf. KB 440874)."
+    fi
     prompt_secret VMSP_PASSWORD "Mot de passe ${VMSP_API_USER} (VCF services runtime)"
     discover_vcfms_vms
   fi
@@ -928,6 +933,19 @@ step_4_license_server() {
   shutdown_vms "License server" sequential ${LICENSE_SERVER_VMS[@]+"${LICENSE_SERVER_VMS[@]}"}
 }
 
+# official_supports <--option> — l'option est-elle une étiquette « case » du
+# parseur d'arguments du script officiel (ex. « --skip-poweroff) ») ?
+official_supports() {
+  grep -Eq -- "^[[:space:]]*([^)#]*\|[[:space:]]*)?${1}[[:space:]]*(\|[^)]*)?\)" "${VCFMS_SHUTDOWN_SCRIPT}"
+}
+
+official_script_info() {
+  local version sum
+  version=$(awk -F'"' '/SCRIPT_VERSION=/ {print $2; exit}' "${VCFMS_SHUTDOWN_SCRIPT}" 2> /dev/null || true)
+  sum=$( (shasum -a 256 "${VCFMS_SHUTDOWN_SCRIPT}" 2> /dev/null || sha256sum "${VCFMS_SHUTDOWN_SCRIPT}" 2> /dev/null) | awk '{print substr($1, 1, 12)}')
+  log "Script officiel : ${VCFMS_SHUTDOWN_SCRIPT} (version ${version:-?}, sha256 ${sum:-?}…)"
+}
+
 step_5_vcf_services_runtime() {
   log_step "Étape 5/11 — VCF management services (VCF services runtime)"
   if [[ -z "${VCFMS_NODE_IP}" ]]; then
@@ -943,9 +961,26 @@ step_5_vcf_services_runtime() {
   # contrôleurs, power-off-marker). On garde la main sur l'arrêt des VMs
   # pour faire un « Shut down Guest OS » comme la doc (lui fait un
   # power-off forcé).
-  local -a args=(--node-ip "${VCFMS_NODE_IP}" --skip-poweroff)
+  # Les versions du script de la KB 440874 n'ont pas toutes les mêmes options :
+  # on n'envoie que celles qu'il connaît.
+  local -a args=(--node-ip "${VCFMS_NODE_IP}")
+  if official_supports --skip-poweroff; then
+    args+=(--skip-poweroff)
+  elif official_supports --poweroff-vms; then
+    log "  Version sans --skip-poweroff : les VMs ne sont pas éteintes par défaut (pas de --poweroff-vms)."
+  else
+    log_warn "  Option d'extinction des VMs non reconnue dans le script officiel : VCENTER_USERNAME/PASSWORD retirés pour qu'il ne les éteigne pas."
+  fi
+  if official_supports --kubeconfig; then
+    [[ -n "${VCFMS_KUBECONFIG}" ]] ||
+      die "Cette version du script officiel attend --kubeconfig : renseigne VCFMS_KUBECONFIG (kubeconfig du VCF services runtime, cf. KB 440874)."
+    [[ -f "${VCFMS_KUBECONFIG}" ]] || die "Kubeconfig introuvable : ${VCFMS_KUBECONFIG}"
+    args+=(--kubeconfig "${VCFMS_KUBECONFIG}")
+  elif [[ -n "${VCFMS_KUBECONFIG}" ]]; then
+    log_warn "  VCFMS_KUBECONFIG défini mais ce script officiel ne gère pas --kubeconfig : ignoré."
+  fi
   [[ "${DRY_RUN}" == "true" ]] && args+=(--dry-run)
-  [[ "${SKIP_SNAPSHOT_CHECK}" == "true" ]] && args+=(--skip-snapshot-check)
+  [[ "${SKIP_SNAPSHOT_CHECK}" == "true" ]] && official_supports --skip-snapshot-check && args+=(--skip-snapshot-check)
 
   log "Appel du script officiel : $(basename "${VCFMS_SHUTDOWN_SCRIPT}") ${args[*]}"
   if ! env -u VCENTER_USERNAME -u VCENTER_PASSWORD \
