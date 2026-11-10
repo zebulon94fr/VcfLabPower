@@ -23,7 +23,10 @@
 #    8  NSX Edge / VNA                (Shut down Guest OS)
 #    9  NSX Manager                   (Shut down Guest OS)
 #   10  SDDC Manager                  (Shut down Guest OS)
-#   11  vCenter, VMs d'infra (DNS/NTP/AD), vSAN et hôtes ESX
+#   11  vCenter, VMs d'infra (DNS/NTP/AD), stockage et hôtes ESX
+#       - vSAN : reboot_helper.py (scripté) ou Shutdown Cluster wizard
+#       - NFS/FC : hôtes sans vCenter en maintenance + arrêt via vCenter,
+#         puis vCenter et son hôte en direct (équivalent Host Client)
 #
 # À exécuter depuis une machine d'admin HORS du domaine de gestion
 # (pas depuis SDDC Manager : il est arrêté à l'étape 10).
@@ -132,7 +135,8 @@ set_defaults() {
   SDDC_MANAGER_VM=""
 
   INFRA_VMS=()
-  VSAN_SHUTDOWN_MODE="manual"  # manual | wizard
+  MGMT_STORAGE="vsan"          # vsan | nfs (NFS ou Fibre Channel)
+  VSAN_SHUTDOWN_MODE="manual"  # manual | wizard (vSAN uniquement)
   VSAN_SHARED_WITNESS="false"
 
   VM_SHUTDOWN_TIMEOUT=600
@@ -277,6 +281,7 @@ load_config() {
   case "${VCFNET_MODE}" in ui | vm | none) ;; *) die "VCFNET_MODE invalide : ${VCFNET_MODE}" ;; esac
   case "${VCFOPS_OFFLINE_MODE}" in api | ui) ;; *) die "VCFOPS_OFFLINE_MODE invalide : ${VCFOPS_OFFLINE_MODE}" ;; esac
   case "${VSAN_SHUTDOWN_MODE}" in manual | wizard) ;; *) die "VSAN_SHUTDOWN_MODE invalide : ${VSAN_SHUTDOWN_MODE}" ;; esac
+  case "${MGMT_STORAGE}" in vsan | nfs) ;; *) die "MGMT_STORAGE invalide : ${MGMT_STORAGE} (vsan | nfs)" ;; esac
 }
 
 setup_logging() {
@@ -474,7 +479,7 @@ parse_getallvms() {
       if (i > 0) {
         nm = substr(line, 1, i - 1)
         gsub(/[ \t]+$/, "", nm)
-        if (nm == n) { print $1; exit }
+        if (nm == n && !found) { print $1; found = 1 }
       }
     }'
 }
@@ -579,7 +584,7 @@ esx_ensure_no_running_vms() {
 # ---------------------------------------------------------------------------
 check_tools() {
   local -a tools=("curl" "jq" "govc")
-  if step_in_range 11 && [[ "${VSAN_SHUTDOWN_MODE}" == "manual" ]]; then
+  if step_in_range 11 && [[ "${MGMT_STORAGE}" == "vsan" && "${VSAN_SHUTDOWN_MODE}" == "manual" ]]; then
     tools+=("ssh")
     [[ -n "${ESX_ROOT_PASSWORD}" ]] && tools+=("sshpass")
   fi
@@ -673,8 +678,14 @@ discover_vcfms_vms() {
   log "Découverte des nœuds VCF services runtime via l'API (${VCFMS_NODE_IP}:${VCFMS_NODE_PORT})..."
   local base="https://${VCFMS_NODE_IP}:${VCFMS_NODE_PORT}" body code token="" entry name moref parsed=""
 
-  body=$(jq -n --arg u "${VMSP_API_USER}" --arg p "${VMSP_PASSWORD}" '{username: $u, password: $p}' |
-    vcfms_http -X POST "${base}/api/v1/auth/login" -H "Content-Type: application/json" --data-binary @-)
+  local payload_file="${TMP_DIR}/vcfms_login.json"
+  (
+    umask 077
+    jq -n --arg u "${VMSP_API_USER}" --arg p "${VMSP_PASSWORD}" '{username: $u, password: $p}' > "${payload_file}"
+  )
+  body=$(vcfms_http -X POST "${base}/api/v1/auth/login" -H "Content-Type: application/json" \
+    --data-binary "@${payload_file}")
+  rm -f "${payload_file}"
   code=$(vcfms_http_code)
   if [[ "${code}" == "200" ]]; then
     token=$(printf '%s' "${body}" | jq -r '.token // empty' 2> /dev/null || true)
@@ -826,8 +837,10 @@ preflight() {
     [[ -n "${VCENTER_VM}" ]] || die "VCENTER_VM non défini."
     CLUSTER_PATH=$(govc find / -type c -name "${MGMT_CLUSTER}" 2> /dev/null | head -1 || true)
     [[ -n "${CLUSTER_PATH}" ]] || die "Cluster '${MGMT_CLUSTER}' introuvable."
-    log "Cluster de gestion : ${CLUSTER_PATH}"
-    if [[ "${VSAN_SHUTDOWN_MODE}" == "manual" ]]; then
+    log "Cluster de gestion : ${CLUSTER_PATH} (stockage ${MGMT_STORAGE})"
+    if [[ "${MGMT_STORAGE}" == "nfs" ]]; then
+      nfs_preflight
+    elif [[ "${VSAN_SHUTDOWN_MODE}" == "manual" ]]; then
       [[ "${VSAN_SHARED_WITNESS}" == "true" ]] &&
         die "reboot_helper.py ne doit pas être utilisé avec un witness partagé (KB 455801). Utilise VSAN_SHUTDOWN_MODE=wizard."
       check_esx_hosts
@@ -850,7 +863,7 @@ confirm_execution() {
     echo "  8  NSX Edge / VNA        : ${#NSX_EDGE_VMS[@]} VM(s)"
     echo "  9  NSX Manager           : ${#NSX_MANAGER_VMS[@]} VM(s)"
     echo "  10 SDDC Manager          : ${SDDC_MANAGER_VM:-non configuré}"
-    echo "  11 vCenter/vSAN/ESX      : ${VCENTER_VM:-?} + ${#INFRA_VMS[@]} VM(s) d'infra, ${#ESX_HOSTS[@]} hôte(s), mode ${VSAN_SHUTDOWN_MODE}"
+    echo "  11 vCenter/vSAN/ESX      : ${VCENTER_VM:-?} + ${#INFRA_VMS[@]} VM(s) d'infra, stockage ${MGMT_STORAGE}$([[ "${MGMT_STORAGE}" == "vsan" ]] && echo ", mode ${VSAN_SHUTDOWN_MODE}")"
   } >&2
   log_warn "Rappels doc : arrêter les workload domains AVANT le domaine de gestion ; en arrêt de fleet complet, l'instance qui héberge VCF Operations en dernier."
 
@@ -1153,7 +1166,7 @@ vsan_manual_shutdown() {
   else
     out=$(esx_ssh "${first}" "python ${REBOOT_HELPER} prepare" 2>&1) || true
     printf '%s\n' "${out}" | sed 's/^/    /' >&2
-    printf '%s' "${out}" | grep -q "Cluster preparation is done" ||
+    [[ "${out}" == *"Cluster preparation is done"* ]] ||
       die "reboot_helper.py prepare n'a pas abouti. NE PAS le relancer à l'aveugle (KB 390160) : analyser l'erreur (NTP : KB 410326, réseau : KB 385699)."
   fi
 
@@ -1191,6 +1204,167 @@ vsan_manual_shutdown() {
   fi
 }
 
+# -- Étape 11, stockage NFS / Fibre Channel -----------------------------------
+# Doc VCF 9.1 « Shut Down ESX Hosts with NFS or Fibre Channel Storage in the
+# Management Domain » : hôtes sans vCenter en maintenance puis arrêtés via
+# vCenter ; puis, sur l'hôte du vCenter (Host Client), Shut down Guest OS du
+# vCenter et arrêt de l'hôte. Les VMs d'infra sont migrées sur cet hôte et
+# arrêtées après le vCenter (prérequis de la doc).
+
+VC_HOST_REF=""
+VC_HOST_NAME=""
+VC_HOST_PATH=""
+
+# esx_govc <hôte> <args govc...> — govc directement contre un ESXi (équivalent Host Client)
+esx_govc() {
+  local host="${1}"
+  shift
+  GOVC_URL="https://${host}" GOVC_USERNAME="${ESX_SSH_USER}" GOVC_PASSWORD="${ESX_ROOT_PASSWORD}" \
+    GOVC_DATACENTER="" govc "${@}"
+}
+
+locate_vcenter_host() {
+  local vc_path
+  vc_path=$(resolve_vm "${VCENTER_VM}") || die "VM vCenter '${VCENTER_VM}' introuvable."
+  VC_HOST_REF=$(govc object.collect -s "${vc_path}" runtime.host 2> /dev/null || true)
+  [[ -n "${VC_HOST_REF}" ]] || die "Impossible de déterminer l'hôte du vCenter."
+  VC_HOST_NAME=$(govc object.collect -s "${VC_HOST_REF}" name 2> /dev/null || true)
+  VC_HOST_PATH=$(govc ls -L "${VC_HOST_REF}" 2> /dev/null || true)
+  [[ -n "${VC_HOST_NAME}" && -n "${VC_HOST_PATH}" ]] || die "Hôte du vCenter (${VC_HOST_REF}) introuvable."
+}
+
+nfs_preflight() {
+  locate_vcenter_host
+  log "Le vCenter tourne sur ${VC_HOST_NAME} : cet hôte sera arrêté en dernier."
+  prompt_secret ESX_ROOT_PASSWORD "Mot de passe ${ESX_SSH_USER} de l'ESX ${VC_HOST_NAME} (Host Client)"
+  if esx_govc "${VC_HOST_NAME}" about > /dev/null 2>&1; then
+    log "Connexion directe à ${VC_HOST_NAME} OK (identifiants ESX valides)."
+  else
+    die "Connexion directe à https://${VC_HOST_NAME} impossible (ESX_SSH_USER / ESX_ROOT_PASSWORD ?)."
+  fi
+}
+
+host_state() {
+  govc object.collect -s "${1}" runtime.connectionState 2> /dev/null || echo "unknown"
+}
+
+nfs_shutdown() {
+  local vm path cur_host hpath elapsed state
+  locate_vcenter_host
+
+  save_cluster_state
+  echo "VCENTER_HOST='${VC_HOST_NAME}'" >> "${STATE_FILE}"
+  log "Hôte du vCenter (à noter pour le redémarrage) : ${VC_HOST_NAME}"
+
+  log "Désactivation de vSphere HA et passage de DRS en manuel (placement figé)..."
+  run govc cluster.change -ha-enabled=false "${CLUSTER_PATH}" || log_warn "Échec désactivation HA."
+  run govc cluster.change -drs-mode manual "${CLUSTER_PATH}" || log_warn "Échec passage DRS manuel."
+
+  # a) VMs d'infra regroupées sur l'hôte du vCenter
+  for vm in ${INFRA_VMS[@]+"${INFRA_VMS[@]}"}; do
+    path=$(resolve_vm "${vm}") || {
+      log_warn "  VM d'infra '${vm}' introuvable — ignorée."
+      continue
+    }
+    cur_host=$(govc object.collect -s "${path}" runtime.host 2> /dev/null || true)
+    if [[ "${cur_host}" != "${VC_HOST_REF}" ]]; then
+      log "  Migration de '${vm}' vers ${VC_HOST_NAME}"
+      run govc vm.migrate -host "${VC_HOST_PATH}" "${path}" > /dev/null ||
+        die "Migration de '${vm}' vers ${VC_HOST_NAME} impossible."
+    fi
+  done
+
+  # b) Autres hôtes du cluster : maintenance puis arrêt via vCenter
+  local -a other_hosts=()
+  while IFS= read -r hpath; do
+    [[ -z "${hpath}" || "${hpath}" == "${VC_HOST_PATH}" ]] && continue
+    other_hosts+=("${hpath}")
+  done <<< "$(govc find "${CLUSTER_PATH}" -type h 2> /dev/null || true)"
+
+  for hpath in ${other_hosts[@]+"${other_hosts[@]}"}; do
+    log "  ${hpath##*/} : mode maintenance"
+    run govc host.maintenance.enter "${hpath}" > /dev/null ||
+      die "${hpath##*/} n'a pas pu entrer en maintenance (VM encore allumée dessus ?)."
+  done
+  for hpath in ${other_hosts[@]+"${other_hosts[@]}"}; do
+    log "  ${hpath##*/} : arrêt"
+    run govc host.shutdown "${hpath}" > /dev/null || die "Arrêt de ${hpath##*/} impossible."
+  done
+  if [[ "${DRY_RUN}" == "false" ]]; then
+    for hpath in ${other_hosts[@]+"${other_hosts[@]}"}; do
+      elapsed=0
+      while state=$(host_state "${hpath}") && [[ "${state}" == "connected" ]]; do
+        if [[ "${elapsed}" -ge "${ESX_SHUTDOWN_TIMEOUT}" ]]; then
+          log_warn "  ${hpath##*/} toujours connecté après ${ESX_SHUTDOWN_TIMEOUT}s — vérifie la console."
+          break
+        fi
+        sleep "${POLL_INTERVAL}"
+        elapsed=$((elapsed + POLL_INTERVAL))
+      done
+      log "  ${hpath##*/} : ${state}"
+    done
+  fi
+
+  # c) Hôte du vCenter, directement (Host Client) : vCenter, VMs d'infra, puis l'hôte
+  log "Connexion directe à ${VC_HOST_NAME} (le vCenter va être arrêté)..."
+  local vm_esx
+  for vm in "${VCENTER_VM}" ${INFRA_VMS[@]+"${INFRA_VMS[@]}"}; do
+    vm_esx=$(esx_govc "${VC_HOST_NAME}" find / -type m -name "${vm}" 2> /dev/null | head -1 || true)
+    if [[ -z "${vm_esx}" ]]; then
+      log_warn "  '${vm}' introuvable sur ${VC_HOST_NAME} — ignorée."
+      continue
+    fi
+    if [[ "$(esx_govc "${VC_HOST_NAME}" object.collect -s "${vm_esx}" runtime.powerState 2> /dev/null)" == "poweredOff" ]]; then
+      log "  '${vm}' déjà éteinte."
+      continue
+    fi
+    log "  Shut down Guest OS : ${vm} (sur ${VC_HOST_NAME})"
+    if ! run esx_govc "${VC_HOST_NAME}" vm.power -s "${vm_esx}" > /dev/null; then
+      [[ "${FORCE_POWEROFF}" == "true" ]] || die "Arrêt Guest OS de '${vm}' refusé (VMware Tools ?). Relance avec --force-poweroff."
+      run esx_govc "${VC_HOST_NAME}" vm.power -off -force "${vm_esx}" > /dev/null
+    fi
+    [[ "${DRY_RUN}" == "true" ]] && continue
+    elapsed=0
+    until [[ "$(esx_govc "${VC_HOST_NAME}" object.collect -s "${vm_esx}" runtime.powerState 2> /dev/null)" == "poweredOff" ]]; do
+      if [[ "${elapsed}" -ge "${VM_SHUTDOWN_TIMEOUT}" ]]; then
+        [[ "${FORCE_POWEROFF}" == "true" ]] || die "'${vm}' toujours allumée après ${VM_SHUTDOWN_TIMEOUT}s."
+        log_warn "  Délai dépassé — hard power-off de '${vm}'."
+        run esx_govc "${VC_HOST_NAME}" vm.power -off -force "${vm_esx}" > /dev/null
+        break
+      fi
+      sleep "${POLL_INTERVAL}"
+      elapsed=$((elapsed + POLL_INTERVAL))
+    done
+    log "  '${vm}' éteinte (${elapsed}s)."
+  done
+
+  local running
+  running=$(esx_govc "${VC_HOST_NAME}" find / -type m -runtime.powerState poweredOn 2> /dev/null |
+    sed 's|.*/||' | grep -v '^vCLS' || true)
+  if [[ -n "${running}" ]]; then
+    [[ "${DRY_RUN}" == "true" ]] || die "VM(s) encore allumée(s) sur ${VC_HOST_NAME} : $(echo "${running}" | tr '\n' ' ')"
+    log_warn "VM(s) encore allumée(s) sur ${VC_HOST_NAME} : $(echo "${running}" | tr '\n' ' ') (dry-run : normal)"
+  fi
+
+  log "Arrêt de ${VC_HOST_NAME}"
+  run esx_govc "${VC_HOST_NAME}" host.shutdown -f > /dev/null || log_warn "Commande d'arrêt de ${VC_HOST_NAME} en erreur — vérifie la console."
+
+  log_warn "Stockage NFS/FC : ne l'arrêter que si aucun autre client ne l'utilise (doc du constructeur)."
+}
+
+print_restart_notes_nfs() {
+  local first_host="${VC_HOST_NAME}"
+  [[ -n "${first_host}" ]] || first_host="l'hôte du vCenter (voir ${STATE_FILE:-logs})"
+  log_step "Au redémarrage"
+  {
+    echo "  1. Démarrer le stockage NFS/FC et l'infra physique."
+    echo "  2. Démarrer d'abord ${first_host}, puis le vCenter et les VMs d'infra depuis le Host Client."
+    echo "  3. Démarrer les autres hôtes et les sortir du mode maintenance."
+    echo "  4. Réactiver HA/DRS comme avant (état d'origine : ${STATE_FILE:-voir logs})."
+    echo "  5. Suivre la procédure de démarrage VCF 9.1 (ordre inverse)."
+  } >&2
+}
+
 print_restart_notes() {
   log_step "Au redémarrage"
   {
@@ -1205,8 +1379,13 @@ print_restart_notes() {
 }
 
 step_11_vsan_esx() {
-  log_step "Étape 11/11 — vCenter, VMs d'infrastructure, vSAN et hôtes ESX"
+  log_step "Étape 11/11 — vCenter, VMs d'infrastructure, stockage et hôtes ESX"
   check_remaining_vms
+  if [[ "${MGMT_STORAGE}" == "nfs" ]]; then
+    nfs_shutdown
+    print_restart_notes_nfs
+    return 0
+  fi
   if [[ "${VSAN_SHUTDOWN_MODE}" == "wizard" ]]; then
     print_wizard_instructions
     return 0
