@@ -1,6 +1,6 @@
 # VcfLabPower
 
-Arrêt et redémarrage ordonnés du **domaine de gestion d'un lab VMware Cloud Foundation 9.1**, en bash.
+Arrêt et redémarrage ordonnés du **domaine de management d'un lab VMware Cloud Foundation 9.1**, en bash.
 
 | Script | Rôle |
 |---|---|
