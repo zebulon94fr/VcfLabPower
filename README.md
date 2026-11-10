@@ -1,6 +1,14 @@
 # VcfLabPower
 
-Arrêt ordonné du **domaine de gestion d'un lab VMware Cloud Foundation 9.1**, en un seul script bash.
+Arrêt et redémarrage ordonnés du **domaine de gestion d'un lab VMware Cloud Foundation 9.1**, en bash.
+
+| Script | Rôle |
+|---|---|
+| `vcf_lab_shutdown.sh` | Arrêt, ordre de la doc « Shut Down the Management Domain » |
+| `vcf_lab_startup.sh` | Démarrage, ordre de la doc « Start the Management Domain » |
+| `vcf_lab_common.sh` | Fonctions partagées (sourcé par les deux scripts) |
+
+Les deux scripts lisent **le même fichier de configuration**. Le démarrage réutilise aussi l'état sauvegardé à l'arrêt dans `logs/cluster_state_<cluster>.env` : hôte du vCenter et réglages HA/DRS d'origine.
 
 L'ordre d'arrêt suit la documentation Broadcom
 [Shut Down the Management Domain (VCF 9.1)](https://techdocs.broadcom.com/us/en/vmware-cis/vcf/vcf-9-0-and-later/9-1/fleet-management/vcf-shutdown-and-startup/vcf-shutdown/shut-down-the-management-domain.html).
@@ -72,7 +80,8 @@ Les secrets se passent par variables d'environnement. S'ils sont absents, le scr
 | `GOVC_PASSWORD` | vCenter de gestion |
 | `VMSP_PASSWORD` | `vmware-system-user` du VCF services runtime |
 | `VCFOPS_ADMIN_PASSWORD` | compte `admin` local de VCF Operations (`/admin`) |
-| `ESX_ROOT_PASSWORD` | root ESX : SSH en vSAN (sinon clé SSH) ; connexion directe à l'ESX du vCenter en NFS/FC |
+| `ESX_ROOT_PASSWORD` | root ESX : SSH en vSAN (sinon clé SSH) ; connexion directe à l'ESX du vCenter en NFS/FC et au démarrage |
+| `NSX_ADMIN_PASSWORD` | démarrage : compte `admin` de NSX Manager, si `NSX_MANAGER_FQDN` est défini |
 
 ## Utilisation
 
@@ -125,7 +134,42 @@ Il suit la doc VCF 9.1 [Shut Down ESX Hosts with NFS or Fibre Channel Storage in
 
 Un seul cluster de gestion est géré. S'il y en a plusieurs, il faut arrêter d'abord ceux qui n'hébergent pas le vCenter.
 
-## Redémarrage (rappel)
+## Démarrage : `vcf_lab_startup.sh`
+
+L'ordre suit la doc Broadcom [Start the Management Domain (VCF 9.1)](https://techdocs.broadcom.com/us/en/vmware-cis/vcf/vcf-9-0-and-later/9-1/fleet-management/vcf-shutdown-and-startup/sddc-startup/start-the-management-domain.html) :
+
+| Étape | Composant | Méthode |
+|---|---|---|
+| 1 | Hôtes ESX, stockage, vCenter | Allumage via `ESX_POWERON_CMD` ou pause manuelle, attente des hôtes, puis VMs d'infra **puis** vCenter (connexion directe à l'ESX), attente de l'API vCenter, sortie de maintenance, restauration HA/DRS |
+| 2 | SDDC Manager | Power On, attente des VMware Tools |
+| 3 | NSX Manager | Power On, puis attente de l'état **STABLE** (API si `NSX_MANAGER_FQDN`, sinon pause manuelle) |
+| 4 | NSX Edge / VNA | Power On |
+| 5 | Protection & recovery | Power On |
+| 6 | VCF Operations | Nœuds dans l'ordre KB 341964 (inverse de `VCFOPS_VMS`), puis **Bring Cluster Online** (API CaSA ou pause UI) |
+| 7 | VCF services runtime | Control plane d'abord (`VCFMS_CONTROL_VMS` ou VMs avec le moins de mémoire), `VCFMS_CONTROL_WAIT` s d'attente, puis workers, puis attente de l'API de gestion |
+| 8 | License server | Power On |
+| 9 | Cloud proxies | Power On |
+| 10 | VCF Operations for networks | Pause : Power On via VCF Operations (State management) |
+| 11 | VCF Automation | Pause : Power On via VCF Operations (State management) |
+| 12 | Workloads du domaine de gestion | Power On |
+
+```bash
+./vcf_lab_startup.sh --dry-run          # simulation (fonctionne lab éteint : liste les actions)
+./vcf_lab_startup.sh                    # démarrage réel (confirmation « STARTUP »)
+./vcf_lab_startup.sh --from-step 6      # reprise (le vCenter doit répondre)
+```
+
+**Selon le stockage :**
+
+- **NFS / FC** : l'hôte qui hébergeait le vCenter (`VCENTER_HOST` dans l'état sauvegardé) est attendu en premier. Le script sort cet hôte du mode maintenance si besoin, attend que le datastore de chaque VM soit accessible, puis démarre les VMs d'infra et le vCenter. Les autres hôtes sont ensuite sortis du mode maintenance via vCenter.
+- **vSAN, mode `manual`** : sortie de maintenance de tous les hôtes, puis `reboot_helper.py recover` sur **un seul** hôte. Viennent ensuite `IgnoreClusterMemberListUpdates = 0` sur chaque hôte, puis les VMs d'infra et le vCenter.
+- **vSAN, mode `wizard`** : après l'allumage des hôtes, le script attend le vCenter puis demande de lancer *Restart cluster* dans le vSphere Client.
+
+**VCF services runtime :** l'API de gestion est éteinte au démarrage, donc les nœuds sont trouvés par `VCFMS_VMS` ou `VCFMS_VM_PATTERN`. Il faut compter environ 20 min pour que la récupération automatique se termine. Vérifie ensuite dans VCF Operations > Build > Lifecycle > VCF Management Components > VCF services runtime que tous les services sont « running ». Si ce n'est pas le cas après 15-20 min, suis la [KB 440862](https://knowledge.broadcom.com/external/article/440862).
+
+Pour démarrer ensuite les workload domains, voir [Start the Virtual Infrastructure Workload Domain](https://techdocs.broadcom.com/us/en/vmware-cis/vcf/vcf-9-0-and-later/9-1/fleet-management/vcf-shutdown-and-startup/sddc-startup/start-the-virtual-infrastructure-workload-domain.html).
+
+## Redémarrage manuel (rappel)
 
 **vSAN :**
 
