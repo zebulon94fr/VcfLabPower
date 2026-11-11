@@ -204,14 +204,31 @@ power_on_vms() {
 }
 
 request_power_on() {
-  local path="${1}" state
+  local path="${1}" state err attempt=1
   state=$(vm_power_state "${path}")
   if [[ "${state}" == "poweredOn" ]]; then
     log "  '${path##*/}' déjà allumée."
     return 0
   fi
   log "  Power On : ${path##*/}"
-  run govc vm.power -on "${path}" > /dev/null || die "Power On de '${path##*/}' impossible (VM inaccessible ? datastore monté ?)."
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    run govc vm.power -on "${path}"
+    return 0
+  fi
+  # Juste après le redémarrage du vCenter (HA/DRS en cours de configuration),
+  # vCenter peut refuser le placement (« No host is compatible ») : on réessaie.
+  while ! err=$(govc vm.power -on "${path}" 2>&1 > /dev/null); do
+    [[ "$(vm_power_state "${path}")" == "poweredOn" ]] && return 0
+    if [[ "${attempt}" -ge "${VM_POWERON_RETRIES}" ]]; then
+      log_error "  ${err}"
+      log_error "  Derniers événements de '${path##*/}' :"
+      govc events -n 8 "${path}" 2> /dev/null | sed 's/^/    /' >&2 || true
+      die "Power On de '${path##*/}' refusé ${attempt} fois. Corrige la cause ci-dessus puis relance avec --from-step <étape>."
+    fi
+    log_warn "  Power On refusé (${err##*: }) — nouvel essai dans ${VM_POWERON_RETRY_DELAY}s (${attempt}/${VM_POWERON_RETRIES})."
+    sleep "${VM_POWERON_RETRY_DELAY}"
+    attempt=$((attempt + 1))
+  done
 }
 
 wait_vm_tools() {
@@ -502,9 +519,28 @@ restore_ha_drs() {
   if [[ "${ha}" == "true" ]]; then
     log "Réactivation de vSphere HA"
     run govc cluster.change -ha-enabled=true "${target}" || log_warn "Échec réactivation HA."
+    wait_ha_ready
   else
     log "HA était '${ha:-inconnu}' avant l'arrêt : pas de changement."
   fi
+}
+
+# HA configuré sur l'hôte : maître élu ou connecté au maître
+host_ha_ready() {
+  local state
+  state=$(govc object.collect -s "${1}" runtime.dasHostState.state 2> /dev/null || true)
+  [[ "${state}" == "master" || "${state}" == "connectedToMaster" ]]
+}
+
+wait_ha_ready() {
+  local hpath
+  [[ "${DRY_RUN}" == "true" || -z "${CLUSTER_PATH}" ]] && return 0
+  log "Attente de la configuration de vSphere HA sur les hôtes (jusqu'à ${HA_READY_TIMEOUT}s)..."
+  while IFS= read -r hpath; do
+    [[ -z "${hpath}" ]] && continue
+    wait_until "${HA_READY_TIMEOUT}" "HA sur ${hpath##*/}" host_ha_ready "${hpath}" ||
+      log_warn "  HA pas prêt sur ${hpath##*/} après ${HA_READY_TIMEOUT}s (état : $(govc object.collect -s "${hpath}" runtime.dasHostState.state 2> /dev/null || echo ?)) — on continue."
+  done <<< "$(govc find "${CLUSTER_PATH}" -type h 2> /dev/null || true)"
 }
 
 start_nfs() {

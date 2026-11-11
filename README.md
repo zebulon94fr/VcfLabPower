@@ -140,7 +140,7 @@ L'ordre suit la doc Broadcom [Start the Management Domain (VCF 9.1)](https://tec
 
 | Étape | Composant | Méthode |
 |---|---|---|
-| 1 | Hôtes ESX, stockage, vCenter | Allumage via `ESX_POWERON_CMD` ou pause manuelle, attente des hôtes, puis VMs d'infra **puis** vCenter (connexion directe à l'ESX), attente de l'API vCenter, sortie de maintenance, restauration HA/DRS |
+| 1 | Hôtes ESX, stockage, vCenter | Allumage via `ESX_POWERON_CMD` ou pause manuelle, attente des hôtes, puis VMs d'infra **puis** vCenter (connexion directe à l'ESX), attente de l'API vCenter, sortie de maintenance, restauration HA/DRS et **attente de la configuration HA** |
 | 2 | SDDC Manager | Power On, attente des VMware Tools |
 | 3 | NSX Manager | Power On, puis attente de l'état **STABLE** (API si `NSX_MANAGER_FQDN`, sinon pause manuelle) |
 | 4 | NSX Edge / VNA | Power On |
@@ -164,6 +164,8 @@ L'ordre suit la doc Broadcom [Start the Management Domain (VCF 9.1)](https://tec
 - **NFS / FC** : l'hôte qui hébergeait le vCenter (`VCENTER_HOST` dans l'état sauvegardé) est attendu en premier. Le script sort cet hôte du mode maintenance si besoin, attend que le datastore de chaque VM soit accessible, puis démarre les VMs d'infra et le vCenter. Les autres hôtes sont ensuite sortis du mode maintenance via vCenter.
 - **vSAN, mode `manual`** : sortie de maintenance de tous les hôtes, puis `reboot_helper.py recover` sur **un seul** hôte. Viennent ensuite `IgnoreClusterMemberListUpdates = 0` sur chaque hôte, puis les VMs d'infra et le vCenter.
 - **vSAN, mode `wizard`** : après l'allumage des hôtes, le script attend le vCenter puis demande de lancer *Restart cluster* dans le vSphere Client.
+
+**Power On refusé :** juste après le redémarrage du vCenter, il peut refuser un Power On avec « No host is compatible with the virtual machine » tant que HA/DRS se configure. Le script réessaie (`VM_POWERON_RETRIES` fois, toutes les `VM_POWERON_RETRY_DELAY` s). En cas d'échec définitif, il affiche les derniers événements de la VM, qui donnent la vraie cause.
 
 **VCF services runtime :** l'API de gestion est éteinte au démarrage, donc les nœuds sont trouvés par `VCFMS_VMS` ou `VCFMS_VM_PATTERN`. Il faut compter environ 20 min pour que la récupération automatique se termine. Vérifie ensuite dans VCF Operations > Build > Lifecycle > VCF Management Components > VCF services runtime que tous les services sont « running ». Si ce n'est pas le cas après 15-20 min, suis la [KB 440862](https://knowledge.broadcom.com/external/article/440862).
 
