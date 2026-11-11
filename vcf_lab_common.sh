@@ -382,6 +382,9 @@ vcfops_online_state() {
 }
 
 # esx_govc <hôte> <args govc...> — govc directement contre un ESXi (équivalent Host Client)
+# esx_host_path <hôte> — chemin de l'hôte dans son propre inventaire (connexion directe)
+esx_host_path() { esx_govc "${1}" find / -type h 2> /dev/null | head -1; }
+
 esx_govc() {
   local host="${1}"
   shift

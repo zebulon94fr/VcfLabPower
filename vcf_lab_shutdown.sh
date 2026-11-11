@@ -1076,7 +1076,15 @@ nfs_shutdown() {
   fi
 
   log "Arrêt de ${VC_HOST_NAME}"
-  run esx_govc "${VC_HOST_NAME}" host.shutdown -f > /dev/null || log_warn "Commande d'arrêt de ${VC_HOST_NAME} en erreur — vérifie la console."
+  local esx_hpath
+  esx_hpath=$(esx_host_path "${VC_HOST_NAME}" || true)
+  if [[ -z "${esx_hpath}" ]]; then
+    log_warn "Chemin de ${VC_HOST_NAME} introuvable en connexion directe — arrête-le depuis le Host Client."
+  else
+    # -f : l'hôte n'est pas en maintenance (comme l'arrêt depuis le Host Client)
+    run esx_govc "${VC_HOST_NAME}" host.shutdown -f "${esx_hpath}" > /dev/null ||
+      log_warn "Commande d'arrêt de ${VC_HOST_NAME} en erreur — vérifie la console."
+  fi
 
   log_warn "Stockage NFS/FC : ne l'arrêter que si aucun autre client ne l'utilise (doc du constructeur)."
 }

@@ -369,7 +369,6 @@ confirm_execution() {
 # ---------------------------------------------------------------------------
 esx_reachable() { esx_govc "${1}" about > /dev/null 2>&1; }
 
-esx_host_path() { esx_govc "${1}" find / -type h 2> /dev/null | head -1; }
 
 power_on_hosts() {
   local host cmd
