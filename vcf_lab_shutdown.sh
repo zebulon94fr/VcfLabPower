@@ -361,7 +361,9 @@ check_inventory_and_snapshots() {
     [[ -z "${vm}" ]] && continue
     rc=0
     path=$(resolve_vm "${vm}") || rc=$?
-    if [[ "${rc}" -eq 2 ]]; then
+    if [[ "${rc}" -eq 3 ]]; then
+      die "Impossible d'interroger le vCenter pour '${vm}' (voir l'erreur ci-dessus)."
+    elif [[ "${rc}" -eq 2 ]]; then
       die "Rends le nom '${vm}' unique ou utilise un MoRef (VirtualMachine:vm-xx)."
     elif [[ "${rc}" -ne 0 ]]; then
       log_warn "  Introuvable : ${vm}"

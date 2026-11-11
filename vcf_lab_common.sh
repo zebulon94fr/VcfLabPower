@@ -188,16 +188,47 @@ setup_logging() {
 
 # resolve_vm <nom | /chemin/inventaire | VirtualMachine:vm-xx> → chemin d'inventaire sur stdout
 #   rc 1 = introuvable, rc 2 = nom ambigu
+# govc_retry <args govc...> — jusqu'à 3 essais (vCenter lent ou qui finit de
+# démarrer) ; stderr du dernier essai dans ${TMP_DIR}/govc_err
+govc_retry() {
+  local attempt=1 out
+  while true; do
+    if out=$(govc "${@}" 2> "${TMP_DIR}/govc_err"); then
+      [[ -n "${out}" ]] && printf '%s\n' "${out}"
+      return 0
+    fi
+    [[ "${attempt}" -ge 3 ]] && return 1
+    sleep 5
+    attempt=$((attempt + 1))
+  done
+}
+
+govc_last_error() { tr '\n' ' ' < "${TMP_DIR}/govc_err" 2> /dev/null | cut -c1-300; }
+
+#   rc 1 = introuvable, rc 2 = nom ambigu, rc 3 = erreur govc/vCenter
 resolve_vm() {
   local id="${1}" out count
-  if [[ "${id}" == VirtualMachine:* ]]; then
-    out=$(govc ls -L "${id}" 2> /dev/null) || return 1
-  elif [[ "${id}" == /* ]]; then
-    # Chemin d'inventaire complet : on vérifie seulement qu'il existe
-    govc object.collect -s "${id}" name > /dev/null 2>&1 || return 1
-    out="${id}"
+  if [[ "${id}" == VirtualMachine:* || "${id}" == /* ]]; then
+    if [[ "${id}" == VirtualMachine:* ]]; then
+      out=$(govc_retry ls -L "${id}") || out=""
+    elif govc_retry object.collect -s "${id}" name > /dev/null; then
+      out="${id}"
+    else
+      out=""
+    fi
+    if [[ -z "${out}" ]]; then
+      if grep -qiE 'not ?found|no such|ManagedObjectNotFound' "${TMP_DIR}/govc_err" 2> /dev/null ||
+        [[ ! -s "${TMP_DIR}/govc_err" ]]; then
+        return 1
+      fi
+      log_error "govc en erreur sur '${id}' : $(govc_last_error)"
+      return 3
+    fi
   else
-    out=$(govc find / -type m -name "${id}" 2> /dev/null) || return 1
+    if ! out=$(govc_retry find / -type m -name "${id}"); then
+      log_error "Recherche de la VM '${id}' en erreur (vCenter) : $(govc_last_error)"
+      return 3
+    fi
   fi
   [[ -n "${out}" ]] || return 1
   count=$(printf '%s\n' "${out}" | grep -c .)
@@ -225,7 +256,7 @@ resolve_vms() {
     path=$(resolve_vm "${id}") || rc=$?
     case "${rc}" in
       0) printf '%s\n' "${path}" ;;
-      2) return 2 ;;
+      2 | 3) return "${rc}" ;;
       *) log_warn "  VM '${id}' introuvable dans l'inventaire — ignorée." ;;
     esac
   done
