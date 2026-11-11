@@ -83,6 +83,7 @@ set_defaults() {
   NSX_START_TIMEOUT=1800
   VCFOPS_ONLINE_TIMEOUT=3600
   VCFMS_START_TIMEOUT=1800
+  CYCLE_DELAY=120           # vcf_lab_cycle.sh : pause entre arrêt et démarrage
 
   VM_SHUTDOWN_TIMEOUT=600
   VCFOPS_OFFLINE_TIMEOUT=3600

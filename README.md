@@ -6,6 +6,7 @@ Arrêt et redémarrage ordonnés du **domaine de management d'un lab VMware Clou
 |---|---|
 | `vcf_lab_shutdown.sh` | Arrêt, ordre de la doc « Shut Down the Management Domain » |
 | `vcf_lab_startup.sh` | Démarrage, ordre de la doc « Start the Management Domain » |
+| `vcf_lab_cycle.sh` | Cycle complet arrêt → démarrage (test de bout en bout) |
 | `vcf_lab_common.sh` | Fonctions partagées (sourcé par les deux scripts) |
 
 Les deux scripts lisent **le même fichier de configuration**. Le démarrage réutilise aussi l'état sauvegardé à l'arrêt dans `logs/cluster_state_<cluster>.env` : hôte du vCenter et réglages HA/DRS d'origine.
@@ -170,6 +171,33 @@ L'ordre suit la doc Broadcom [Start the Management Domain (VCF 9.1)](https://tec
 **VCF services runtime :** l'API de gestion est éteinte au démarrage, donc les nœuds sont trouvés par `VCFMS_VMS` ou `VCFMS_VM_PATTERN`. Il faut compter environ 20 min pour que la récupération automatique se termine. Vérifie ensuite dans VCF Operations > Build > Lifecycle > VCF Management Components > VCF services runtime que tous les services sont « running ». Si ce n'est pas le cas après 15-20 min, suis la [KB 440862](https://knowledge.broadcom.com/external/article/440862).
 
 Pour démarrer ensuite les workload domains, voir [Start the Virtual Infrastructure Workload Domain](https://techdocs.broadcom.com/us/en/vmware-cis/vcf/vcf-9-0-and-later/9-1/fleet-management/vcf-shutdown-and-startup/sddc-startup/start-the-virtual-infrastructure-workload-domain.html).
+
+## Cycle complet : `vcf_lab_cycle.sh`
+
+`vcf_lab_cycle.sh` enchaîne l'arrêt puis le démarrage avec le même fichier de configuration :
+
+1. Il demande **une seule fois** les secrets (vCenter, root ESX, `vmware-system-user`, admin VCF Operations, admin NSX) et les transmet aux deux scripts.
+2. Il lance l'arrêt. **S'il échoue, le démarrage n'est pas lancé.**
+3. Il attend que **tous les ESX ne répondent plus** : un hôte encore en train de s'arrêter serait vu « joignable » par le démarrage. Il fait ensuite une pause de `CYCLE_DELAY` s (120 par défaut, `--delay N` pour la changer).
+4. Il lance le démarrage.
+
+```bash
+./vcf_lab_cycle.sh --dry-run      # simulation des deux phases
+./vcf_lab_cycle.sh                # cycle réel (confirmation « CYCLE »)
+./vcf_lab_cycle.sh --yes --delay 300
+```
+
+Pour un cycle **sans aucune intervention**, la configuration doit éviter toutes les pauses manuelles. Le script liste celles qui restent avant de commencer, et refuse de partir sans terminal s'il en reste :
+
+| Pause | Pour l'éviter |
+|---|---|
+| Allumage des hôtes | `ESX_POWERON_CMD` (IPMI, Wake-on-LAN…) |
+| État STABLE de NSX | `NSX_MANAGER_FQDN` |
+| Offline / online de VCF Operations | `VCFOPS_OFFLINE_MODE="api"` |
+| VCF Automation / Ops for networks | `VCFA_MODE` / `VCFNET_MODE` à `none` (ou `vm`, raccourci de lab) |
+| vSAN wizard | `VSAN_SHUTDOWN_MODE="manual"` |
+
+Comme le cycle exporte `ESX_ROOT_PASSWORD`, l'arrêt vSAN en mode `manual` passe par `sshpass`.
 
 ## Redémarrage manuel (rappel)
 
