@@ -7,7 +7,8 @@ Arrêt et redémarrage ordonnés du **domaine de management d'un lab VMware Clou
 | `vcf_lab_shutdown.sh` | Arrêt, ordre de la doc « Shut Down the Management Domain » |
 | `vcf_lab_startup.sh` | Démarrage, ordre de la doc « Start the Management Domain » |
 | `vcf_lab_cycle.sh` | Cycle complet arrêt → démarrage (test de bout en bout) |
-| `vcf_lab_common.sh` | Fonctions partagées (sourcé par les deux scripts) |
+| `vcf_lab_ha.sh` | Lancement non interactif pour Home Assistant (SSH, webhook de retour) |
+| `vcf_lab_common.sh` | Fonctions partagées (sourcé par les autres scripts) |
 
 Les deux scripts lisent **le même fichier de configuration**. Le démarrage réutilise aussi l'état sauvegardé à l'arrêt dans `logs/cluster_state_<cluster>.env` : hôte du vCenter et réglages HA/DRS d'origine.
 
@@ -198,6 +199,97 @@ Pour un cycle **sans aucune intervention**, la configuration doit éviter toutes
 | vSAN wizard | `VSAN_SHUTDOWN_MODE="manual"` |
 
 Comme le cycle exporte `ESX_ROOT_PASSWORD`, l'arrêt vSAN en mode `manual` passe par `sshpass`.
+
+## Pilotage depuis Home Assistant : `vcf_lab_ha.sh`
+
+Les boutons d'un dashboard Home Assistant lancent l'arrêt et le démarrage complets par SSH sur la machine d'admin. HA n'exécute rien lui-même : il n'a ni govc, ni jq, ni le script officiel KB 440874.
+
+```
+Bouton HA ──► script.vcf_lab_commande ──► shell_command.vcflab (ssh)
+                                              │
+               machine d'admin : vcf_lab_ha.sh shutdown|startup|status
+                 ├─ pré-vérifications (secrets, pauses manuelles, vCenter / ESX joignables)
+                 ├─ lance vcf_lab_shutdown.sh / vcf_lab_startup.sh --yes en arrière-plan
+                 └─ répond tout de suite en JSON (shell_command coupe à 60 s)
+               ... fin de l'exécution ──► webhook HA ──► input_select + notification
+```
+
+`vcf_lab_ha.sh` :
+
+- refuse de partir si une **pause manuelle** reste dans la configuration (mêmes règles que `vcf_lab_cycle.sh`). Sans `ESX_POWERON_CMD`, le démarrage n'est accepté que si tous les ESX répondent déjà ;
+- refuse une deuxième exécution tant que la première tourne (verrou `logs/ha_run.lock`) ;
+- écrit l'état dans `logs/ha_status.json` et le journal dans `logs/ha_<action>_<date>.log` ;
+- prévient HA au début et à la fin (`HA_WEBHOOK_URL`), avec les dernières lignes du journal ;
+- répond toujours par **une ligne JSON**, avec le code retour 0 : `{"result":"started"|"refused"|"status", "message": ...}`.
+
+```bash
+./vcf_lab_ha.sh status
+./vcf_lab_ha.sh shutdown --dry-run     # passe par toute la chaîne, sans rien arrêter
+./vcf_lab_ha.sh startup
+```
+
+### Machine d'admin
+
+1. Une machine **toujours allumée et hors du lab** (elle doit survivre à l'arrêt des ESX), avec le dépôt et la configuration habituelle (`vcf_lab_shutdown.local.conf`).
+2. La configuration ne doit contenir **aucune pause manuelle** : `VCFA_MODE` / `VCFNET_MODE` à `none` ou `vm`, `VCFOPS_OFFLINE_MODE="api"`, `NSX_MANAGER_FQDN` renseigné, `VSAN_SHUTDOWN_MODE="manual"` en vSAN, et **`ESX_POWERON_CMD`** pour rallumer les ESX éteints par l'arrêt (IPMI, AMT, Wake-on-LAN...).
+3. Les secrets dans `vcf_lab_ha.local.conf` (ignoré par git, **chmod 600** obligatoire) :
+
+   ```bash
+   GOVC_PASSWORD='...'
+   ESX_ROOT_PASSWORD='...'
+   VMSP_PASSWORD='...'           # si VCFMS_NODE_IP
+   VCFOPS_ADMIN_PASSWORD='...'   # si VCFOPS_OFFLINE_MODE=api
+   NSX_ADMIN_PASSWORD='...'      # si NSX_MANAGER_FQDN
+   HA_WEBHOOK_URL='http://<ip-home-assistant>:8123/api/webhook/<webhook_id>'
+   ```
+
+4. La clé publique de HA dans `~/.ssh/authorized_keys`, **limitée à ce script** (commande forcée : la clé ne peut rien lancer d'autre que `shutdown`, `startup` ou `status`) :
+
+   ```
+   restrict,command="/chemin/VcfLabPower/vcf_lab_ha.sh --ssh" ssh-ed25519 AAAA... home-assistant
+   ```
+
+   Linux avec systemd : `loginctl enable-linger <utilisateur>` si `KillUserProcesses=yes`, sinon l'exécution est tuée à la fin de la session SSH. macOS : empêche la mise en veille pendant l'exécution.
+
+### Home Assistant
+
+1. Clé SSH, depuis l'app **Terminal & SSH** (la configuration de HA y est sous `/homeassistant`, HA la voit sous `/config`) :
+
+   ```bash
+   mkdir -p /homeassistant/.ssh/vcflab && cd /homeassistant/.ssh/vcflab
+   ssh-keygen -t ed25519 -N '' -C home-assistant -f id_ed25519
+   cat id_ed25519.pub        # à mettre dans authorized_keys (étape 4 ci-dessus)
+   ```
+
+   Puis `/homeassistant/.ssh/vcflab/config` :
+
+   ```
+   Host vcflab-admin
+     HostName <ip-machine-admin>
+     User <utilisateur>
+     IdentityFile /config/.ssh/vcflab/id_ed25519
+     IdentitiesOnly yes
+     UserKnownHostsFile /config/.ssh/vcflab/known_hosts
+     StrictHostKeyChecking accept-new
+     BatchMode yes
+     ConnectTimeout 10
+     LogLevel ERROR
+   ```
+
+2. Dans `configuration.yaml` (app **File editor**), puis redémarrage de HA :
+
+   ```yaml
+   shell_command:
+     vcflab: "ssh -F /config/.ssh/vcflab/config vcflab-admin {{ cmd }}"
+   ```
+
+3. Côté HA, les objets suivants appellent ce `shell_command` :
+   - `script.vcf_lab_commande` (champs `commande` = `shutdown` / `startup` / `status`, `dry_run`) ;
+   - `script.vcf_shutdown_all_vms` et `script.vcf_startup_vms`, appelés par les boutons ;
+   - `input_select.vcf_lab_etat_alimentation` : état affiché sur le dashboard ;
+   - `automation.vcf_lab_retour_vcflabpower` : reçoit le webhook et relit l'état au démarrage de HA.
+
+Test : *Outils de développement > Actions* > `script.vcf_lab_commande` avec `commande: status`, puis `commande: shutdown` et `dry_run: true`.
 
 ## Redémarrage manuel (rappel)
 

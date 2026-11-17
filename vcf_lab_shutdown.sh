@@ -304,7 +304,7 @@ esx_ensure_no_running_vms() {
     id="${entry%%|*}"
     name="${entry#*|}"
     [[ "$(esx_vm_state "${host}" "${id}")" == "Powered on" ]] || continue
-    if [[ "${name}" == vCLS* ]]; then
+    if [[ "${name}" == vCLS* ]] || is_supervisor_system_vm "${name}"; then
       log "  ${host} : power-off de la VM système '${name}'."
       run esx_ssh "${host}" "vim-cmd vmsvc/power.off ${id}" > /dev/null || true
     else
@@ -316,6 +316,148 @@ esx_ensure_no_running_vms() {
     [[ "${DRY_RUN}" == "true" ]] || die "${host} : VM(s) encore allumée(s) : ${running[*]} — éteins-les avant le mode maintenance."
     log_warn "${host} : VM(s) encore allumée(s) : ${running[*]} (dry-run : normal)"
   fi
+}
+
+# ---------------------------------------------------------------------------
+# vSphere Supervisor — arrêt depuis l'ESX (VMs gérées par ESX Agent Manager)
+# Ordre KB 446899 : service wcp, pause VKS, control plane, nœuds VKS, LB.
+# ---------------------------------------------------------------------------
+# sv_request_shutdown <chemin> <force> — Shut down Guest OS depuis l'hôte qui porte la VM
+sv_request_shutdown() {
+  local path="${1}" force="${2}" name="${1##*/}" host
+  if [[ "$(vm_power_state "${path}")" == "poweredOff" ]]; then
+    log "  '${name}' déjà éteinte."
+    return 0
+  fi
+  host=$(vm_host_name "${path}") || die "Hôte ESX de '${name}' introuvable."
+  log "  Shut down Guest OS : ${name} (depuis ${host})"
+  if ! run esx_govc "${host}" vm.power -s "${name}" > /dev/null; then
+    [[ "${force}" == "true" ]] ||
+      die "Arrêt Guest OS de '${name}' refusé par ${host}. Relance avec --force-poweroff."
+    log_warn "  Arrêt Guest OS refusé — power-off de '${name}'."
+    run esx_govc "${host}" vm.power -off -force "${name}" > /dev/null || true
+  fi
+}
+
+# sv_wait_off <chemin> <délai> <force>
+sv_wait_off() {
+  local path="${1}" timeout="${2}" force="${3}" name="${1##*/}" host elapsed=0
+  [[ "${DRY_RUN}" == "true" ]] && return 0
+  while [[ "$(vm_power_state "${path}")" != "poweredOff" ]]; do
+    if [[ "${elapsed}" -ge "${timeout}" ]]; then
+      [[ "${force}" == "true" ]] ||
+        die "'${name}' toujours allumée après ${timeout}s (relance avec --force-poweroff pour forcer)."
+      host=$(vm_host_name "${path}") || die "Hôte ESX de '${name}' introuvable."
+      log_warn "  '${name}' toujours allumée après ${timeout}s — power-off depuis ${host}."
+      run esx_govc "${host}" vm.power -off -force "${name}" > /dev/null || true
+      break
+    fi
+    sleep "${POLL_INTERVAL}"
+    elapsed=$((elapsed + POLL_INTERVAL))
+  done
+  log "  '${name}' éteinte (${elapsed}s)."
+}
+
+# sv_shutdown_group <libellé> <chemins (un par ligne)> <délai> <force>
+sv_shutdown_group() {
+  local label="${1}" list="${2}" timeout="${3}" force="${4}" path
+  local -a paths=()
+  while IFS= read -r path; do
+    [[ -n "${path}" ]] && paths+=("${path}")
+  done <<< "${list}"
+  [[ "${#paths[@]}" -eq 0 ]] && return 0
+  log "${label} : ${#paths[@]} VM(s)."
+  for path in "${paths[@]}"; do
+    sv_request_shutdown "${path}" "${force}"
+  done
+  for path in "${paths[@]}"; do
+    sv_wait_off "${path}" "${timeout}" "${force}"
+  done
+}
+
+# Inventaire du Supervisor (rempli par discover_supervisor)
+SV_CP=""
+SV_LB=""
+SV_POD=""
+SV_VKS=""
+
+sv_count() { grep -c . <<< "${1}" || true; }
+
+# VMs système du Supervisor que le vCenter rallume tant qu'il tourne
+# (Foundation Load Balancer : « vCenter automatically restores the VMs ») :
+# arrêtées de nouveau depuis l'ESX à l'étape 11.
+is_supervisor_system_vm() {
+  [[ "${SUPERVISOR_MODE}" != "none" ]] || return 1
+  case "${1}" in
+    flb-* | SupervisorControlPlaneVM*) return 0 ;;
+  esac
+  return 1
+}
+
+# esx_poweroff_supervisor_vms <hôte> — arrêt (Guest OS puis forcé) des VMs
+# système du Supervisor encore allumées sur l'hôte, en connexion directe
+esx_poweroff_supervisor_vms() {
+  local host="${1}" path name elapsed
+  while IFS= read -r path; do
+    [[ -z "${path}" ]] && continue
+    name="${path##*/}"
+    is_supervisor_system_vm "${name}" || continue
+    log "  ${host} : arrêt de '${name}' (Supervisor, rallumée par le vCenter)"
+    run esx_govc "${host}" vm.power -s "${path}" > /dev/null ||
+      run esx_govc "${host}" vm.power -off -force "${path}" > /dev/null || true
+    [[ "${DRY_RUN}" == "true" ]] && continue
+    elapsed=0
+    until [[ "$(esx_govc "${host}" object.collect -s "${path}" runtime.powerState 2> /dev/null)" == "poweredOff" ]]; do
+      if [[ "${elapsed}" -ge 120 ]]; then
+        log_warn "  '${name}' toujours allumée après 120s — power-off."
+        run esx_govc "${host}" vm.power -off -force "${path}" > /dev/null || true
+        break
+      fi
+      sleep "${POLL_INTERVAL}"
+      elapsed=$((elapsed + POLL_INTERVAL))
+    done
+  done <<< "$(esx_govc "${host}" find / -type m -runtime.powerState poweredOn 2> /dev/null || true)"
+  return 0
+}
+
+discover_supervisor() {
+  [[ "${SUPERVISOR_MODE}" == "none" ]] && return 0
+  SV_CP=$(supervisor_vms cp)
+  SV_LB=$(supervisor_vms lb)
+  SV_POD=$(supervisor_vms pod)
+  SV_VKS=$(supervisor_vms vks)
+  if [[ -z "${SV_CP}${SV_LB}${SV_POD}${SV_VKS}" ]]; then
+    log "vSphere Supervisor : aucun dans l'inventaire."
+    return 0
+  fi
+  log "vSphere Supervisor : $(sv_count "${SV_CP}") VM(s) control plane, $(sv_count "${SV_LB}") Foundation Load Balancer, $(sv_count "${SV_POD}") vSphere Pod(s), $(sv_count "${SV_VKS}") nœud(s) VKS."
+  vc_api_login || die "API REST du vCenter inaccessible (https://$(vc_api_host)/api) : nécessaire pour arrêter le service wcp."
+  log "  Service wcp du vCenter : $(wcp_state)"
+  prompt_secret ESX_ROOT_PASSWORD "Mot de passe ${ESX_SSH_USER} des ESX (arrêt des VMs du Supervisor depuis les hôtes)"
+  if [[ -n "${SV_VKS}" && "${DRY_RUN}" != "true" && ! -t 0 ]]; then
+    die "Clusters VKS présents : il faut les mettre en pause à la main pendant l'arrêt (KB 446899), impossible sans terminal. Lance l'arrêt depuis un terminal."
+  fi
+}
+
+supervisor_shutdown() {
+  [[ "${SUPERVISOR_MODE}" == "none" ]] && return 0
+  [[ -z "${SV_CP}${SV_LB}${SV_POD}${SV_VKS}" ]] && discover_supervisor
+  [[ -z "${SV_CP}${SV_LB}${SV_POD}${SV_VKS}" ]] && return 0
+
+  log "vSphere Supervisor (KB 446899)."
+  wcp_set stop STOPPED
+  if [[ -n "${SV_VKS}" ]]; then
+    manual_checkpoint "Mets en pause chaque cluster VKS depuis un nœud control plane du Supervisor : kubectl get clusters -A, puis kubectl patch cluster <nom> -n <namespace> --type merge -p '{\"spec\":{\"paused\":true}}'."
+  fi
+  sv_shutdown_group "Control plane du Supervisor" "${SV_CP}" "${VM_SHUTDOWN_TIMEOUT}" "${FORCE_POWEROFF}"
+  sv_shutdown_group "Nœuds worker VKS" "$(grep -vi 'control-plane' <<< "${SV_VKS}" || true)" "${VM_SHUTDOWN_TIMEOUT}" "${FORCE_POWEROFF}"
+  sv_shutdown_group "Nœuds control plane VKS" "$(grep -i 'control-plane' <<< "${SV_VKS}" || true)" "${VM_SHUTDOWN_TIMEOUT}" "${FORCE_POWEROFF}"
+  # vSphere Pods : power-off si l'arrêt Guest OS n'aboutit pas (notes de version Supervisor)
+  sv_shutdown_group "vSphere Pods" "${SV_POD}" "${SUPERVISOR_POD_TIMEOUT}" true
+  sv_shutdown_group "Foundation Load Balancer" "${SV_LB}" "${VM_SHUTDOWN_TIMEOUT}" "${FORCE_POWEROFF}"
+  [[ -n "${SV_LB}" ]] &&
+    log "  Le vCenter rallume le Foundation Load Balancer tant qu'il tourne : il est arrêté de nouveau depuis l'ESX à l'étape 11."
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -388,6 +530,43 @@ check_inventory_and_snapshots() {
   else
     log "Aucun snapshot sur les VMs configurées."
   fi
+}
+
+# vcfms_check_login — le script officiel attend sans fin si le login de la VIP
+# ne répond pas (« Authenticating with API server ») : on vérifie avant, et on
+# désigne le nœud dont le node-agent est bloqué.
+vcfms_check_login() {
+  local code out rc=0 entry
+  local -a nodes=()
+  code=$(vcfms_login_code "${VCFMS_NODE_IP}" 15)
+  case "${code}" in
+    200)
+      log "Login VCF services runtime (${VCFMS_NODE_IP}) : OK."
+      return 0
+      ;;
+    401) die "Login VCF services runtime refusé (HTTP 401) : vérifie VMSP_PASSWORD (utilisateur ${VMSP_API_USER})." ;;
+  esac
+  log_warn "Login VCF services runtime via ${VCFMS_NODE_IP} : HTTP ${code} — recherche du nœud en cause..."
+  local -a vms=()
+  while IFS= read -r entry; do
+    [[ -n "${entry}" ]] && vms+=("${entry}")
+  done <<< "$(vcfms_conf_vms)"
+  while IFS= read -r entry; do
+    [[ -n "${entry}" ]] && nodes+=("${entry}")
+  done <<< "$(vcfms_nodes ${vms[@]+"${vms[@]}"})"
+  [[ "${#nodes[@]}" -gt 0 ]] ||
+    die "Login VCF services runtime sans réponse (HTTP ${code}) et nœuds introuvables (renseigne VCFMS_VMS ou VCFMS_VM_PATTERN)."
+  out=$(vcfms_stuck_nodes "${nodes[@]}") || rc=$?
+  case "${rc}" in
+    0)
+      while IFS= read -r entry; do
+        [[ -n "${entry}" ]] && log_alert "$(vcfms_agent_procedure "${entry}") Puis relancer le Shutdown."
+      done <<< "${out}"
+      die "Arrêt annulé avant toute action : node-agent bloqué sur $(printf '%s\n' "${out}" | cut -d'|' -f1 | paste -sd, -) (procédure dans l'alerte)."
+      ;;
+    2) die "Login VCF services runtime sans réponse sur ${VCFMS_NODE_IP} ni sur aucun nœud : vérifie l'état du VCF services runtime avant de relancer." ;;
+    *) die "Login VCF services runtime sans réponse sur ${VCFMS_NODE_IP} (HTTP ${code}) alors que les nœuds répondent : vérifie la VIP avant de relancer." ;;
+  esac
 }
 
 discover_vcfms_vms() {
@@ -520,10 +699,13 @@ preflight() {
       die "Ce script officiel attend --kubeconfig : renseigne VCFMS_KUBECONFIG (cf. KB 440874)."
     fi
     prompt_secret VMSP_PASSWORD "Mot de passe ${VMSP_API_USER} (VCF services runtime)"
+    vcfms_check_login
     discover_vcfms_vms
   fi
 
   check_inventory_and_snapshots
+
+  step_in_range 0 && discover_supervisor
 
   if step_in_range 6 && [[ "${#VCFOPS_VMS[@]}" -gt 0 && "${VCFOPS_OFFLINE_MODE}" == "api" ]]; then
     [[ -n "${VCFOPS_PRIMARY_FQDN}" ]] || die "VCFOPS_PRIMARY_FQDN non défini."
@@ -589,8 +771,9 @@ confirm_execution() {
 # Étapes
 # ---------------------------------------------------------------------------
 step_0_workloads() {
-  log_step "Étape 0/11 — Workloads et VMs hors VCF du domaine de gestion"
+  log_step "Étape 0/11 — Workloads, vSphere Supervisor et VMs hors VCF du domaine de gestion"
   shutdown_vms "Workloads" parallel ${WORKLOAD_VMS[@]+"${WORKLOAD_VMS[@]}"}
+  supervisor_shutdown
 }
 
 # step_ui_or_vm <n> <libellé> <mode> <instruction UI> <ids...>
@@ -683,6 +866,16 @@ step_5_vcf_services_runtime() {
   fi
   [[ "${DRY_RUN}" == "true" ]] && args+=(--dry-run)
   [[ "${SKIP_SNAPSHOT_CHECK}" == "true" ]] && official_supports --skip-snapshot-check && args+=(--skip-snapshot-check)
+  # Consentement demandé par le script officiel : interactif avec un terminal,
+  # sinon --yes seulement si accepté explicitement dans la configuration
+  if official_supports --yes && [[ ! -t 0 ]]; then
+    if [[ "${VCFMS_ACCEPT_CONSENT}" == "true" ]]; then
+      log "  Consentement du script officiel accepté par la configuration (VCFMS_ACCEPT_CONSENT=true) : --yes."
+      args+=(--yes)
+    else
+      die "Le script officiel demande un consentement et il n'y a pas de terminal. Lis ses conditions (lance-le une fois à la main), puis mets VCFMS_ACCEPT_CONSENT=\"true\" dans la configuration."
+    fi
+  fi
 
   log "Appel du script officiel : $(basename "${VCFMS_SHUTDOWN_SCRIPT}") ${args[*]}"
   if ! env -u VCENTER_USERNAME -u VCENTER_PASSWORD \
@@ -787,6 +980,10 @@ check_remaining_vms() {
     name="${line##*/}"
     [[ "${name}" == "${VCENTER_VM}" || "${name}" == vCLS* ]] && continue
     in_list "${name}" ${INFRA_VMS[@]+"${INFRA_VMS[@]}"} && continue
+    if is_supervisor_system_vm "${name}"; then
+      log "  '${name}' allumée : VM du Supervisor rallumée par le vCenter, arrêtée depuis l'ESX plus loin."
+      continue
+    fi
     leftover+=("${name}")
   done <<< "${out}"
 
@@ -842,6 +1039,13 @@ save_cluster_state() {
     | .defaultVmBehavior // .DefaultVmBehavior // "inconnu"' 2> /dev/null || echo "inconnu")
 
   STATE_FILE="${LOG_DIR}/cluster_state_${MGMT_CLUSTER}.env"
+  # Reprise après un arrêt interrompu : HA déjà coupé et DRS déjà manuel par
+  # ce script. L'état d'origine est celui du fichier existant : on le garde.
+  if [[ -f "${STATE_FILE}" && "${ha}" == "false" && "${drs_mode}" == "manual" ]]; then
+    log "HA coupé et DRS manuel : reprise d'un arrêt interrompu, état d'origine conservé ($(grep -E '^(HA_ENABLED|DRS_MODE)=' "${STATE_FILE}" | tr '\n' ' '))."
+    sed -i.bak '/^VCENTER_HOST=/d' "${STATE_FILE}" && rm -f "${STATE_FILE}.bak"
+    return 0
+  fi
   {
     echo "# État du cluster avant arrêt — $(ts)"
     echo "CLUSTER_PATH='${CLUSTER_PATH}'"
@@ -1010,14 +1214,36 @@ nfs_shutdown() {
     other_hosts+=("${hpath}")
   done <<< "$(govc find "${CLUSTER_PATH}" -type h 2> /dev/null || true)"
 
+  # Avec un Supervisor, le mode maintenance demandé au vCenter passe par le
+  # service wcp (« namespaces maintenance mode »), arrêté à l'étape 0 : erreur
+  # 503 en boucle. Comme la KB 446899, on le pose directement sur les hôtes.
+  local direct_mm="false" h esx_hp
+  if [[ "${SUPERVISOR_MODE}" != "none" && -n "$(supervisor_vms cp)$(supervisor_vms lb)" ]]; then
+    direct_mm="true"
+    log "Supervisor présent : mode maintenance et arrêt posés directement sur les hôtes (KB 446899)."
+  fi
   for hpath in ${other_hosts[@]+"${other_hosts[@]}"}; do
-    log "  ${hpath##*/} : mode maintenance"
-    run govc host.maintenance.enter "${hpath}" > /dev/null ||
-      die "${hpath##*/} n'a pas pu entrer en maintenance (VM encore allumée dessus ?)."
+    h="${hpath##*/}"
+    esx_poweroff_supervisor_vms "${h}"
+    log "  ${h} : mode maintenance"
+    if [[ "${direct_mm}" == "true" ]]; then
+      esx_hp=$(esx_host_path "${h}") || true
+      [[ -n "${esx_hp}" ]] || die "${h} injoignable en connexion directe (ESX_ROOT_PASSWORD ?)."
+      run esx_govc "${h}" host.maintenance.enter "${esx_hp}" > /dev/null ||
+        die "${h} n'a pas pu entrer en maintenance (VM encore allumée dessus ?)."
+    else
+      run govc host.maintenance.enter "${hpath}" > /dev/null ||
+        die "${h} n'a pas pu entrer en maintenance (VM encore allumée dessus ?)."
+    fi
   done
   for hpath in ${other_hosts[@]+"${other_hosts[@]}"}; do
-    log "  ${hpath##*/} : arrêt"
-    run govc host.shutdown "${hpath}" > /dev/null || die "Arrêt de ${hpath##*/} impossible."
+    h="${hpath##*/}"
+    log "  ${h} : arrêt"
+    if [[ "${direct_mm}" == "true" ]]; then
+      run esx_govc "${h}" host.shutdown "$(esx_host_path "${h}")" > /dev/null || die "Arrêt de ${h} impossible."
+    else
+      run govc host.shutdown "${hpath}" > /dev/null || die "Arrêt de ${h} impossible."
+    fi
   done
   if [[ "${DRY_RUN}" == "false" ]]; then
     for hpath in ${other_hosts[@]+"${other_hosts[@]}"}; do
@@ -1066,6 +1292,9 @@ nfs_shutdown() {
     done
     log "  '${vm}' éteinte (${elapsed}s)."
   done
+
+  # Le vCenter est arrêté : plus rien ne rallume les VMs du Supervisor
+  esx_poweroff_supervisor_vms "${VC_HOST_NAME}"
 
   local running
   running=$(esx_govc "${VC_HOST_NAME}" find / -type m -runtime.powerState poweredOn 2> /dev/null |

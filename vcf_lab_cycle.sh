@@ -87,34 +87,20 @@ parse_args() {
   done
 }
 
-# Pauses manuelles qui empêcheront un cycle sans intervention
-list_manual_pauses() {
-  [[ -z "${ESX_POWERON_CMD}" ]] && echo "allumage des hôtes (ESX_POWERON_CMD vide)"
-  [[ "${#NSX_MANAGER_VMS[@]}" -gt 0 && -z "${NSX_MANAGER_FQDN}" ]] && echo "état STABLE de NSX (NSX_MANAGER_FQDN vide)"
-  [[ "${#VCFOPS_VMS[@]}" -gt 0 && "${VCFOPS_OFFLINE_MODE}" == "ui" ]] && echo "VCF Operations offline/online (VCFOPS_OFFLINE_MODE=ui)"
-  [[ "${VCFA_MODE}" == "ui" ]] && echo "VCF Automation (VCFA_MODE=ui, à l'arrêt et au démarrage)"
-  [[ "${VCFNET_MODE}" == "ui" ]] && echo "VCF Operations for networks (VCFNET_MODE=ui, à l'arrêt et au démarrage)"
-  [[ "${MGMT_STORAGE}" == "vsan" && "${VSAN_SHUTDOWN_MODE}" == "wizard" ]] && echo "vSAN Shutdown/Restart cluster wizard (VSAN_SHUTDOWN_MODE=wizard)"
-  return 0
-}
-
 collect_secrets() {
+  local line var label
   log_step "Secrets (demandés une seule fois, transmis aux deux scripts)"
-  prompt_secret GOVC_PASSWORD "Mot de passe vCenter pour ${GOVC_USERNAME}"
-  prompt_secret ESX_ROOT_PASSWORD "Mot de passe ${ESX_SSH_USER} des ESX"
-  if [[ -n "${VCFMS_NODE_IP}" ]]; then
-    prompt_secret VMSP_PASSWORD "Mot de passe ${VMSP_API_USER} (VCF services runtime)"
-  fi
-  if [[ "${#VCFOPS_VMS[@]}" -gt 0 && "${VCFOPS_OFFLINE_MODE}" == "api" ]]; then
-    prompt_secret VCFOPS_ADMIN_PASSWORD "Mot de passe ${VCFOPS_ADMIN_USER} de VCF Operations (/admin)"
-  fi
-  if [[ -n "${NSX_MANAGER_FQDN}" ]]; then
-    prompt_secret NSX_ADMIN_PASSWORD "Mot de passe ${NSX_ADMIN_USER} de NSX Manager"
-  fi
+  # fd 3 : stdin reste le terminal pour la saisie des mots de passe
+  while IFS= read -r line <&3; do
+    [[ -n "${line}" ]] || continue
+    var="${line%%|*}"
+    label="${line#*|}"
+    prompt_secret "${var}" "${label}"
+  done 3<<< "$(list_required_secrets cycle)"
   export GOVC_PASSWORD ESX_ROOT_PASSWORD VMSP_PASSWORD VCFOPS_ADMIN_PASSWORD NSX_ADMIN_PASSWORD
 }
 
-esx_down() { ! esx_govc "${1}" about > /dev/null 2>&1; }
+esx_down() { ! esx_reachable "${1}"; }
 
 wait_all_hosts_down() {
   local host elapsed
@@ -150,7 +136,7 @@ main() {
   [[ "${#ESX_HOSTS[@]}" -gt 0 ]] || die "ESX_HOSTS est vide : nécessaire pour vérifier l'arrêt puis le démarrage des hôtes."
 
   local pauses
-  pauses=$(list_manual_pauses)
+  pauses=$(list_manual_pauses cycle)
   if [[ -n "${pauses}" ]]; then
     log_warn "Le cycle s'arrêtera pour des actions manuelles :"
     printf '%s\n' "${pauses}" | sed 's/^/    - /' >&2

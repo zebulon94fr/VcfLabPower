@@ -148,19 +148,24 @@ reverse_lines() {
 }
 
 wait_until() {
-  # wait_until <timeout> <libellé> <commande...> — réessaie jusqu'au succès
-  local timeout="${1}" label="${2}" elapsed=0
+  # wait_until <timeout> <libellé> <commande...> — réessaie jusqu'au succès.
+  # Délai en temps réel (SECONDS) : la commande elle-même peut prendre du temps
+  # (connexions qui n'aboutissent pas), pas seulement les pauses.
+  local timeout="${1}" label="${2}" start="${SECONDS}" last_log="${SECONDS}" elapsed
   shift 2
   [[ "${DRY_RUN}" == "true" ]] && return 0
   until "${@}" > /dev/null 2>&1; do
+    elapsed=$((SECONDS - start))
     if [[ "${elapsed}" -ge "${timeout}" ]]; then
       return 1
     fi
     sleep "${POLL_INTERVAL}"
-    elapsed=$((elapsed + POLL_INTERVAL))
-    [[ $((elapsed % 60)) -lt "${POLL_INTERVAL}" ]] && log "  … ${label} (${elapsed}s)"
+    if [[ $((SECONDS - last_log)) -ge 60 ]]; then
+      log "  … ${label} ($((SECONDS - start))s)"
+      last_log="${SECONDS}"
+    fi
   done
-  log "  ${label} : OK (${elapsed}s)."
+  log "  ${label} : OK ($((SECONDS - start))s)."
 }
 
 vc_reachable() { govc about > /dev/null 2>&1; }
@@ -367,8 +372,6 @@ confirm_execution() {
 # ---------------------------------------------------------------------------
 # Étape 1 — hôtes ESX, stockage, vCenter
 # ---------------------------------------------------------------------------
-esx_reachable() { esx_govc "${1}" about > /dev/null 2>&1; }
-
 
 power_on_hosts() {
   local host cmd
@@ -383,6 +386,14 @@ power_on_hosts() {
       run bash -c "${cmd}" || log_warn "  Commande d'allumage en erreur pour ${host}."
     done
   else
+    local all_up="true"
+    for host in "${ESX_HOSTS[@]}"; do
+      esx_reachable "${host}" || all_up="false"
+    done
+    if [[ "${all_up}" == "true" ]]; then
+      log "  Tous les hôtes répondent déjà : pas d'allumage à faire."
+      return 0
+    fi
     manual_checkpoint "Allume le stockage ${MGMT_STORAGE} puis les hôtes ${ESX_HOSTS[*]} (bouton, iLO/iDRAC/IPMI, AMT...)."
   fi
 }
@@ -484,8 +495,31 @@ wait_vcenter() {
 
 vc_host_connected() { [[ "$(host_state "${1}")" == "connected" ]]; }
 
+# host_in_mm <chemin vCenter> — en maintenance d'après vCenter OU d'après l'ESX
+# lui-même : juste après son démarrage, vCenter peut encore afficher un état
+# périmé pour un hôte mis en maintenance directement sur l'ESX à l'arrêt
+# (cas du Supervisor, étape 11 de l'arrêt).
+host_in_mm() {
+  local hpath="${1}" name="${1##*/}" mm
+  mm=$(govc object.collect -s "${hpath}" runtime.inMaintenanceMode 2> /dev/null || true)
+  [[ "${mm}" == "true" ]] && return 0
+  mm=$(esx_govc "${name}" object.collect -s "$(esx_host_path "${name}")" runtime.inMaintenanceMode 2> /dev/null || true)
+  [[ "${mm}" == "true" ]]
+}
+
+# exit_mm <chemin vCenter> — sortie de maintenance via vCenter (wcp suit ainsi
+# l'état du nœud Supervisor), sinon directement sur l'ESX
+exit_mm() {
+  local hpath="${1}" name="${1##*/}"
+  log "  ${name} : sortie du mode maintenance"
+  run govc host.maintenance.exit "${hpath}" > /dev/null && return 0
+  log_warn "  ${name} : sortie via vCenter en échec — directement sur l'ESX."
+  run esx_govc "${name}" host.maintenance.exit "$(esx_host_path "${name}")" > /dev/null ||
+    die "${name} : sortie du mode maintenance impossible."
+}
+
 reconnect_cluster_hosts() {
-  local hpath mm
+  local hpath
   [[ "${VC_ONLINE}" == "true" && -n "${CLUSTER_PATH}" ]] || {
     log "  [DRY-RUN] Hôtes du cluster : attente de la connexion à vCenter puis sortie du mode maintenance"
     return 0
@@ -494,11 +528,7 @@ reconnect_cluster_hosts() {
     [[ -z "${hpath}" ]] && continue
     wait_until "${ESX_BOOT_TIMEOUT}" "${hpath##*/} connecté à vCenter" vc_host_connected "${hpath}" ||
       die "${hpath##*/} n'est pas connecté à vCenter après ${ESX_BOOT_TIMEOUT}s."
-    mm=$(govc object.collect -s "${hpath}" runtime.inMaintenanceMode 2> /dev/null || echo "?")
-    if [[ "${mm}" == "true" ]]; then
-      log "  ${hpath##*/} : sortie du mode maintenance"
-      run govc host.maintenance.exit "${hpath}" > /dev/null || die "${hpath##*/} : sortie du mode maintenance impossible."
-    fi
+    if host_in_mm "${hpath}"; then exit_mm "${hpath}"; fi
   done <<< "$(govc find "${CLUSTER_PATH}" -type h 2> /dev/null || true)"
 }
 
@@ -531,13 +561,29 @@ host_ha_ready() {
   [[ "${state}" == "master" || "${state}" == "connectedToMaster" ]]
 }
 
+# wait_host_ha <chemin vCenter> — attend HA sur l'hôte ; un hôte resté ou remis
+# en maintenance n'est jamais configuré par HA : on l'en sort au passage
+wait_host_ha() {
+  local hpath="${1}" start="${SECONDS}" last_log="${SECONDS}"
+  until host_ha_ready "${hpath}"; do
+    [[ $((SECONDS - start)) -ge "${HA_READY_TIMEOUT}" ]] && return 1
+    if host_in_mm "${hpath}"; then exit_mm "${hpath}"; fi
+    sleep "${POLL_INTERVAL}"
+    if [[ $((SECONDS - last_log)) -ge 60 ]]; then
+      log "  … HA sur ${hpath##*/} ($((SECONDS - start))s)"
+      last_log="${SECONDS}"
+    fi
+  done
+  log "  HA sur ${hpath##*/} : OK ($((SECONDS - start))s)."
+}
+
 wait_ha_ready() {
   local hpath
   [[ "${DRY_RUN}" == "true" || -z "${CLUSTER_PATH}" ]] && return 0
   log "Attente de la configuration de vSphere HA sur les hôtes (jusqu'à ${HA_READY_TIMEOUT}s)..."
   while IFS= read -r hpath; do
     [[ -z "${hpath}" ]] && continue
-    wait_until "${HA_READY_TIMEOUT}" "HA sur ${hpath##*/}" host_ha_ready "${hpath}" ||
+    wait_host_ha "${hpath}" ||
       log_warn "  HA pas prêt sur ${hpath##*/} après ${HA_READY_TIMEOUT}s (état : $(govc object.collect -s "${hpath}" runtime.dasHostState.state 2> /dev/null || echo ?)) — on continue."
   done <<< "$(govc find "${CLUSTER_PATH}" -type h 2> /dev/null || true)"
 }
@@ -739,14 +785,6 @@ step_6_vcf_operations() {
   fi
 }
 
-# Nœuds du VCF services runtime depuis la conf (l'API est éteinte au démarrage)
-vcfms_vm_paths() {
-  if [[ "${#VCFMS_VMS[@]}" -gt 0 ]]; then
-    resolve_vms "${VCFMS_VMS[@]}"
-  elif [[ -n "${VCFMS_VM_PATTERN}" ]]; then
-    govc find / -type m -name "${VCFMS_VM_PATTERN}" 2> /dev/null || true
-  fi
-}
 
 vcfms_api_ready() {
   local base="https://${VCFMS_NODE_IP}:${VCFMS_NODE_PORT}" body token payload_file="${TMP_DIR}/vcfms_login.json"
@@ -763,6 +801,49 @@ vcfms_api_ready() {
   [[ "$(vcfms_http_code)" == "200" ]]
 }
 
+# vcfms_wait_ready <chemins VM...> — attend l'API de gestion (VIP). Si un nœud
+# répond au login mais qu'un autre reste muet plusieurs passages de suite
+# (node-agent démarré avant l'API Kubernetes), envoie une alerte avec la
+# procédure, puis continue d'attendre : le démarrage reprend seul une fois
+# l'agent redémarré.
+vcfms_wait_ready() {
+  local start="${SECONDS}" last_log="${SECONDS}" streak=0 alerted="" out rc entry
+  local -a nodes=()
+  [[ "${DRY_RUN}" == "true" ]] && return 0
+  until vcfms_api_ready > /dev/null 2>&1; do
+    [[ $((SECONDS - start)) -ge "${VCFMS_START_TIMEOUT}" ]] && return 1
+    if [[ -z "${alerted}" ]]; then
+      # IPs lues dans les VMware Tools : relues tant qu'il en manque
+      if [[ "${#nodes[@]}" -lt "${#}" ]]; then
+        nodes=()
+        while IFS= read -r entry; do
+          [[ -n "${entry}" ]] && nodes+=("${entry}")
+        done <<< "$(vcfms_nodes "${@}")"
+      fi
+      rc=0
+      out=$(vcfms_stuck_nodes ${nodes[@]+"${nodes[@]}"}) || rc=$?
+      if [[ "${rc}" -eq 0 ]]; then
+        streak=$((streak + 1))
+        if [[ "${streak}" -ge 3 ]]; then
+          while IFS= read -r entry; do
+            [[ -n "${entry}" ]] &&
+              log_alert "$(vcfms_agent_procedure "${entry}") Le démarrage attend et reprendra seul ensuite."
+          done <<< "${out}"
+          alerted=1
+        fi
+      else
+        streak=0
+      fi
+    fi
+    sleep "${POLL_INTERVAL}"
+    if [[ $((SECONDS - last_log)) -ge 60 ]]; then
+      log "  … API VCF services runtime ($((SECONDS - start))s)"
+      last_log="${SECONDS}"
+    fi
+  done
+  log "  API VCF services runtime : OK ($((SECONDS - start))s)."
+}
+
 step_7_vcf_services_runtime() {
   log_step "Étape 7/${LAST_STEP} — VCF management services (VCF services runtime)"
   if [[ -z "${VCFMS_NODE_IP}" ]]; then
@@ -776,7 +857,7 @@ step_7_vcf_services_runtime() {
 
   local out path mem min=""
   local -a all=() controls=() workers=()
-  out=$(vcfms_vm_paths) || die "Nœuds VCF services runtime introuvables."
+  out=$(vcfms_conf_vms) || die "Nœuds VCF services runtime introuvables."
   while IFS= read -r path; do
     [[ -n "${path}" ]] && all+=("${path}")
   done <<< "${out}"
@@ -812,7 +893,7 @@ step_7_vcf_services_runtime() {
   fi
 
   log "Attente de l'API de gestion ${VCFMS_NODE_IP} (récupération automatique ~20 min)..."
-  if ! wait_until "${VCFMS_START_TIMEOUT}" "API VCF services runtime" vcfms_api_ready; then
+  if ! vcfms_wait_ready "${all[@]}"; then
     log_warn "L'API de gestion ne répond pas après ${VCFMS_START_TIMEOUT}s."
   fi
   log_warn "À vérifier : VCF Operations > Build > Lifecycle > VCF Management Components > VCF services runtime : tous les services « running », et aucun nouveau worker en cours de redéploiement. Sinon, après 15-20 min : KB 440862."
@@ -840,8 +921,49 @@ step_11_vcf_automation() {
     ${VCFA_VMS[@]+"${VCFA_VMS[@]}"}
 }
 
+# supervisor_vms_on — control plane et Foundation Load Balancer allumés
+supervisor_vms_on() {
+  local path
+  while IFS= read -r path; do
+    [[ -z "${path}" ]] && continue
+    [[ "$(vm_power_state "${path}")" == "poweredOn" ]] || return 1
+  done <<< "$(supervisor_vms cp; supervisor_vms lb)"
+}
+
+# vSphere Supervisor : le vCenter (wcp + ESX Agent Manager) rallume lui-même
+# le control plane et le Foundation Load Balancer ; on démarre wcp s'il a été
+# arrêté, puis on attend que le Supervisor soit Running / Ready.
+supervisor_startup() {
+  [[ "${SUPERVISOR_MODE}" == "none" ]] && return 0
+  # Simulation lab éteint : le vCenter ne répond pas, inutile d'attendre ses délais réseau
+  if [[ "${DRY_RUN}" == "true" ]] && ! curl -sk --max-time 5 -o /dev/null "https://$(vc_api_host)/"; then
+    log "  [DRY-RUN] vCenter injoignable : au démarrage réel, s'il y a un Supervisor, démarrage du service wcp puis attente du control plane, du Foundation Load Balancer et de l'état Running / Ready."
+    return 0
+  fi
+  local cp lb vks
+  cp=$(supervisor_vms cp)
+  lb=$(supervisor_vms lb)
+  vks=$(supervisor_vms vks)
+  if [[ -z "${cp}${lb}${vks}" ]]; then
+    log "vSphere Supervisor : aucun dans l'inventaire."
+    return 0
+  fi
+  log "vSphere Supervisor : $(grep -c . <<< "${cp}" || true) VM(s) control plane, $(grep -c . <<< "${lb}" || true) Foundation Load Balancer."
+  vc_api_login || die "API REST du vCenter inaccessible (https://$(vc_api_host)/api) : nécessaire pour le service wcp."
+  wcp_set start STARTED
+  log "  Le control plane et le Foundation Load Balancer sont rallumés par le vCenter (ESX Agent Manager)."
+  wait_until "${SUPERVISOR_START_TIMEOUT}" "VMs du Supervisor allumées" supervisor_vms_on ||
+    log_warn "VMs du Supervisor toujours éteintes après ${SUPERVISOR_START_TIMEOUT}s : vérifie Supervisor Management dans le vSphere Client."
+  wait_until "${SUPERVISOR_START_TIMEOUT}" "Supervisor Running / Ready" supervisor_ready ||
+    log_warn "Supervisor pas encore Running / Ready ($(supervisor_status | tr '\n' ' ')) : vérifie Supervisor Management."
+  if [[ -n "${vks}" ]]; then
+    log_warn "Clusters VKS : s'ils ont été mis en pause à l'arrêt, réactive-les depuis un nœud control plane du Supervisor (kubectl patch cluster <nom> -n <namespace> --type merge -p '{\"spec\":{\"paused\":false}}')."
+  fi
+}
+
 step_12_workloads() {
-  log_step "Étape 12/${LAST_STEP} — Workloads du domaine de gestion"
+  log_step "Étape 12/${LAST_STEP} — vSphere Supervisor et workloads du domaine de gestion"
+  supervisor_startup
   power_on_vms "Workloads" parallel ${WORKLOAD_VMS[@]+"${WORKLOAD_VMS[@]}"}
 }
 
