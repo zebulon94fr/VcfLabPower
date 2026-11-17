@@ -22,7 +22,7 @@ Le script réutilise le script officiel `vcf_services_runtime_shutdown.sh` (KB 4
 
 | Étape | Composant | Méthode |
 |---|---|---|
-| 0 | Workloads / VMs hors VCF du domaine de gestion | Shut down Guest OS |
+| 0 | Workloads / VMs hors VCF, **vSphere Supervisor** | Shut down Guest OS ; Supervisor selon la KB 446899 (voir [Supervisor](#vsphere-supervisor)) |
 | 1 | VCF Automation | Pause manuelle : power-off via VCF Operations (State management), puis contrôle des VMs |
 | 2 | VCF Operations for networks | Pause manuelle via VCF Operations, puis contrôle des VMs |
 | 3 | Cloud proxies | Shut down Guest OS |
@@ -291,6 +291,29 @@ Bouton HA ──► script.vcf_lab_commande ──► shell_command.vcflab (ssh)
 
 Test : *Outils de développement > Actions* > `script.vcf_lab_commande` avec `commande: status`, puis `commande: shutdown` et `dry_run: true`.
 
+## vSphere Supervisor
+
+Avec `SUPERVISOR_MODE="auto"` (défaut), les scripts détectent un Supervisor dans l'inventaire : VMs `SupervisorControlPlaneVM*`, Foundation Load Balancer `flb-*`, vSphere Pods et nœuds des clusters VKS dans le dossier `SUPERVISOR_FOLDER` (`Namespaces`). `SUPERVISOR_MODE="none"` désactive ce traitement.
+
+**À l'arrêt (étape 0, [KB 446899](https://knowledge.broadcom.com/external/article/446899)) :**
+
+1. Arrêt du service **wcp** du vCenter (API REST, équivalent de `vmon-cli -k wcp`).
+2. S'il existe des clusters VKS : **pause manuelle** de chaque cluster depuis un nœud control plane du Supervisor (`kubectl patch cluster <nom> -n <namespace> --type merge -p '{"spec":{"paused":true}}'`).
+3. Arrêt, dans l'ordre : control plane du Supervisor, workers VKS, control planes VKS, vSphere Pods (power-off après `SUPERVISOR_POD_TIMEOUT` s), Foundation Load Balancer.
+4. Tant qu'il tourne, le vCenter rallume le control plane et le FLB (ESX Agent Manager). À l'étape 11, ces VMs sont donc arrêtées à nouveau en connexion directe sur les ESX.
+
+La pause des clusters VKS demande un terminal : **sans terminal (Home Assistant, `--yes` sans TTY), l'arrêt est refusé tant qu'il existe des nœuds VKS.** Supprime les clusters VKS de test, ou lance l'arrêt depuis un terminal.
+
+**Au démarrage (étape 12) :** démarrage du service wcp. Le vCenter rallume lui-même le control plane et le FLB. Le script attend `SUPERVISOR_START_TIMEOUT` s que les VMs soient allumées et que le Supervisor soit *Running / Ready*, puis rappelle de réactiver les clusters VKS mis en pause (`"paused":false`).
+
+| Variable | Défaut | Rôle |
+|---|---|---|
+| `SUPERVISOR_MODE` | `auto` | `auto` ou `none` |
+| `SUPERVISOR_FOLDER` | `Namespaces` | Dossier VM créé par le Supervisor |
+| `SUPERVISOR_WCP_TIMEOUT` | 300 | Arrêt / démarrage du service wcp |
+| `SUPERVISOR_POD_TIMEOUT` | 120 | vSphere Pods : power-off forcé au-delà |
+| `SUPERVISOR_START_TIMEOUT` | 1800 | Retour du Supervisor au démarrage |
+
 ## Redémarrage manuel (rappel)
 
 **vSAN :**
@@ -321,6 +344,7 @@ Test : *Outils de développement > Actions* > `script.vcf_lab_commande` avec `co
 - [Shut Down the Management Domain (VCF 9.1)](https://techdocs.broadcom.com/us/en/vmware-cis/vcf/vcf-9-0-and-later/9-1/fleet-management/vcf-shutdown-and-startup/vcf-shutdown/shut-down-the-management-domain.html)
 - [Shut Down VCF Management Services](https://techdocs.broadcom.com/us/en/vmware-cis/vcf/vcf-9-0-and-later/9-1/fleet-management/vcf-shutdown-and-startup/vcf-shutdown/shut-down-the-management-domain/shut-down-vcf-managament-services.html) — KB 440874
 - [KB 313533 – état online/offline du cluster VCF Operations](https://knowledge.broadcom.com/external/article/313533)
+- [KB 446899 – arrêt d'un Supervisor / VKS](https://knowledge.broadcom.com/external/article/446899)
 - [KB 341964 – ordre d'arrêt et de démarrage des nœuds VCF Operations](https://knowledge.broadcom.com/external/article/341964)
 - [KB 322144 – reboot_helper.py](https://knowledge.broadcom.com/external/article/322144)
 - [KB 390160](https://knowledge.broadcom.com/external/article/390160), [KB 455801](https://knowledge.broadcom.com/external/article/455801), [KB 410326](https://knowledge.broadcom.com/external/article/410326/vsan-cluster-shutdown-preparation-fails.html)
